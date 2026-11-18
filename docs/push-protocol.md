@@ -4,7 +4,7 @@
 
 `semon receive` is the reference receiver (`semon_push::mirror::Receiver`, see the README's "Receive pushes from your other machines"). It keeps each machine's copy under `DIR/machines/<machine-id>/`, and caps a request body at 6 MiB: one append's 4 MiB of file bytes as base64, plus the JSON around it. Beyond the answers below, it may answer 411 (no `Content-Length`) and 507 (the machine's copy would pass its size cap); a client treats either as a failure.
 
-Registry format 7 stores the origin-generated canonical machine ID
+Registry format 8 stores the origin-generated canonical machine ID
 (`machine-<8 lowercase hex Unix seconds><8 secure random hex digits>`), matching
 directory locator, optional display name, pending code hash, pairing gate, hashed
 push Bearers and pairing/revocation audit. New machine names default to hostname;
@@ -18,7 +18,7 @@ The running receiver reads this state per request, without IPC.
 
 ### `POST <url>/v1/pair`
 
-No Authorization header is required. The strict JSON request is at most 8 KiB:
+An Authorization header is forbidden, including an empty one. The strict JSON request is at most 8 KiB:
 
 ```json
 {"version":1,"code":"01234-5678X","machine_id":"machine-12345678abcdef01","hostname":"laptop"}
@@ -52,6 +52,24 @@ enrollment/connect/renewal remains available pending removal in P3, outside this
 pairing contract. Legacy `DIR/tokens` remains refused and preserved.
 
 The reference receiver takes an exclusive, non-blocking OS lock on its store directory for its lifetime. A second receiver on that directory is refused at startup, so preservation and replacement cannot interleave across receiver instances.
+
+The receiver also serves received-machine Viewer history on the same listener.
+Owner read tokens occupy a separate registry table from machine push credentials
+and one-time pair codes; none grants another credential kind's authority. Read
+login uses `?t=TOKEN`, then redirects to the same path/query with `t` removed and
+sets `semon_session` with a per-process MAC bound to the read-token ID. Every
+cookie/Bearer request reopens current registry custody, so revocation is immediate
+for subsequent requests. Cookies expire on process restart. `semon token --dir DIR`
+creates a read token; `--list` and `--revoke ID` use registry transactions too.
+Only hashes persist, with create/revoke audit. Format 7 is refused without migration.
+
+`--public-url HTTPS_ORIGIN` supplies the exact public Host/Origin allowlist in
+addition to loopback; no forwarded-header trust is implied. An HTTPS public URL
+makes the cookie Secure even when the listener is HTTP. Viewer responses keep the
+existing security headers. Viewer requests close after one response and take at
+most half the total connection cap, while releasing the peer's unauthenticated
+push allowance on classification. Push keep-alive, framing limits and timeouts
+remain in the existing dispatcher. There is no internal proxy or second listener.
 
 The generic push protocol is independent of the retired Encrypted Relay.
 Received content is readable by the receiver; sender redaction and HTTPS do not

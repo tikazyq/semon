@@ -33,6 +33,8 @@ use serde_json::{Value, json};
 mod auth;
 #[path = "serve_body.rs"]
 mod body;
+#[path = "serve_viewer.rs"]
+mod viewer;
 use crate::credentials::Kind;
 use auth::Authenticator;
 pub use auth::{
@@ -146,6 +148,8 @@ pub struct ServeOptions {
     pub tls: Option<TlsFiles>,
     /// The most bytes one machine's copy may hold ([`DEFAULT_MAX_BYTES`]).
     pub max_bytes: u64,
+    /// Exact externally visible Viewer origin behind a tunnel or reverse proxy.
+    pub public_url: Option<String>,
 }
 
 impl ServeOptions {
@@ -157,6 +161,7 @@ impl ServeOptions {
             listen: DEFAULT_LISTEN.parse().expect("the default address parses"),
             tls: None,
             max_bytes: DEFAULT_MAX_BYTES,
+            public_url: None,
         }
     }
 }
@@ -166,6 +171,7 @@ impl ServeOptions {
 struct Admission {
     open: usize,
     provisioning: usize,
+    viewer: usize,
     per_ip: HashMap<IpAddr, usize>,
 }
 
@@ -179,6 +185,7 @@ struct Shared {
     tokens: Authenticator,
     tls: Option<Arc<rustls::ServerConfig>>,
     limits: Limits,
+    viewer: Option<viewer::Viewer>,
     admission: Mutex<Admission>,
     body: Option<crate::body_host::BodyHost<'static>>,
     provisioning: Option<Arc<Mutex<crate::provision::Controller>>>,
@@ -204,6 +211,7 @@ struct Slot {
     /// The address it counts against, until it authenticates.
     ip: Option<IpAddr>,
     provisioning: bool,
+    viewer: bool,
 }
 
 fn release_ip(admission: &mut Admission, ip: IpAddr) {
@@ -231,7 +239,21 @@ impl Slot {
             shared: Arc::clone(shared),
             ip: Some(ip),
             provisioning: false,
+            viewer: false,
         })
+    }
+
+    fn admit_viewer(&mut self) -> bool {
+        let mut admission = self.shared.admission();
+        if admission.viewer >= self.shared.limits.connections / 2 {
+            return false;
+        }
+        admission.viewer += 1;
+        self.viewer = true;
+        if let Some(ip) = self.ip.take() {
+            release_ip(&mut admission, ip);
+        }
+        true
     }
 
     fn admit_provisioning(&mut self) -> bool {
@@ -263,6 +285,9 @@ impl Drop for Slot {
         if self.provisioning {
             admission.provisioning -= 1;
         }
+        if self.viewer {
+            admission.viewer -= 1;
+        }
         if let Some(ip) = self.ip.take() {
             release_ip(&mut admission, ip);
         }
@@ -277,6 +302,7 @@ pub struct Server {
     tokens: Authenticator,
     tls: Option<Arc<rustls::ServerConfig>>,
     limits: Limits,
+    viewer: viewer::Viewer,
     provisioning: Option<Arc<Mutex<crate::provision::Controller>>>,
 }
 
@@ -295,8 +321,15 @@ impl Server {
             .transpose()?;
         let listener = TcpListener::bind(options.listen)
             .map_err(|error| format!("cannot listen on {}: {error}", options.listen))?;
+        let viewer = viewer::Viewer::new(
+            dir,
+            listener.local_addr().map_err(|e| e.to_string())?,
+            options.public_url.as_deref(),
+            tls.is_some(),
+        )?;
         Ok(Self {
             listener,
+            viewer,
             credential_count,
             receiver: Receiver::new(dir.clone())
                 .map_err(|error| error.to_string())?
@@ -360,6 +393,7 @@ impl Server {
             tokens: self.tokens,
             tls: self.tls,
             limits: self.limits,
+            viewer: Some(self.viewer),
             admission: Mutex::new(Admission::default()),
             body,
             provisioning: self.provisioning,
@@ -593,6 +627,10 @@ struct Head {
     expect_other: bool,
     authorization: Option<String>,
     content_type: Option<String>,
+    host: Option<String>,
+    origin: Option<String>,
+    cookie: Option<String>,
+    if_none_match: Option<String>,
 }
 
 /// Why no request head was read.
@@ -771,6 +809,9 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        303 => "See Other",
+        403 => "Forbidden",
+        503 => "Service Unavailable",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
@@ -878,6 +919,18 @@ fn parse_head(bytes: &[u8]) -> Result<Head, (u16, &'static str)> {
                 } else {
                     head.expect_other = true;
                 }
+            }
+            "host" | "origin" | "cookie" | "if-none-match" => {
+                let field = match name.to_ascii_lowercase().as_str() {
+                    "host" => &mut head.host,
+                    "origin" => &mut head.origin,
+                    "cookie" => &mut head.cookie,
+                    _ => &mut head.if_none_match,
+                };
+                if field.is_some() {
+                    return Err(MALFORMED);
+                }
+                *field = Some(value.to_owned());
             }
             "content-type" => {
                 if head.content_type.is_some() {
@@ -1214,7 +1267,11 @@ fn answer_provisioning(slot: &mut Slot, connection: &mut Connection, head: &Head
 
 fn answer_pair(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &Head) -> Next {
     let refused = || Next::Refuse(403, "pairing refused", &[]);
-    if head.method != "POST" || head.transfer_encoding || head.expect_other {
+    if head.method != "POST"
+        || head.transfer_encoding
+        || head.expect_other
+        || (head.target == "/v1/pair" && head.authorization.is_some())
+    {
         return refused();
     }
     let Some(length) = head.content_length.filter(|n| *n <= 8192) else {
@@ -1255,6 +1312,11 @@ fn answer_pair(shared: &Shared, slot: &mut Slot, connection: &mut Connection, he
 /// Checks a request in order (endpoint, method, framing, token, size) and,
 /// only once all pass, reads its body and answers it.
 fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &Head) -> Next {
+    if !head.target.starts_with("/v1/")
+        && let Some(viewer) = &shared.viewer
+    {
+        return viewer.answer(slot, connection, head);
+    }
     if head.target == "/v1/pair" || head.target == "/v1/unpair" {
         return answer_pair(shared, slot, connection, head);
     }

@@ -98,8 +98,14 @@ impl Fixture {
 
     /// Starts `semon receive` on a free loopback port and returns its URL.
     fn start_receiver(&mut self) -> String {
+        self.start_receiver_with(&[])
+    }
+
+    fn start_receiver_with(&mut self, args: &[&str]) -> String {
         let mut child = semon()
-            .args(["receive", "--listen", "127.0.0.1:0", "--dir"])
+            .args(["receive", "--listen", "127.0.0.1:0"])
+            .args(args)
+            .arg("--dir")
             .arg(self.dir())
             .env("HOME", self.path("home"))
             .stdout(Stdio::null())
@@ -203,6 +209,39 @@ impl Fixture {
     }
 }
 
+struct HttpReply {
+    status: u16,
+    head: String,
+    body: String,
+}
+impl HttpReply {
+    fn header(&self, name: &str) -> &str {
+        self.head
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name).then(|| value.trim())
+            })
+            .unwrap()
+    }
+}
+fn http(url: &str, method: &str, target: &str, host: &str, headers: &str, body: &str) -> HttpReply {
+    use std::io::{Read, Write};
+    let mut socket = std::net::TcpStream::connect(url.strip_prefix("http://").unwrap()).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(socket, "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    HttpReply {
+        status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        head: head.into(),
+        body: body.into(),
+    }
+}
+
 fn line(value: serde_json::Value) -> String {
     value.to_string() + "\n"
 }
@@ -281,6 +320,126 @@ fn enroll_fixture(dir: &Path) -> String {
 }
 
 #[test]
+fn receiver_serves_viewer_login_bearers_and_revocation_on_the_push_port() {
+    let mut fixture = Fixture::new();
+    let push_token = enroll_fixture(&fixture.dir());
+    let created = semon()
+        .args(["token", "--dir"])
+        .arg(fixture.dir())
+        .output()
+        .unwrap();
+    assert_ok(&created, "create read token");
+    let token = String::from_utf8(created.stdout).unwrap().trim().to_owned();
+    let listing = semon()
+        .args(["token", "--dir"])
+        .arg(fixture.dir())
+        .arg("--list")
+        .output()
+        .unwrap();
+    assert_ok(&listing, "list read tokens");
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    let id = listing.split_whitespace().next().unwrap();
+    assert!(!listing.contains(&token));
+    let url = fixture.start_receiver_with(&["--public-url", "https://history.example"]);
+    let get =
+        |target: &str, headers: &str| http(&url, "GET", target, "history.example", headers, "");
+    let bearer = format!("Authorization: Bearer {token}\r\n");
+    assert_eq!(get("/", "").status, 401);
+    assert_eq!(
+        get("/", &format!("Authorization: Bearer {push_token}\r\n")).status,
+        401
+    );
+    assert_eq!(
+        http(&url, "GET", "/", "evil.example", &bearer, "").status,
+        403
+    );
+    assert_eq!(
+        get("/", &format!("{bearer}Origin: https://evil.example\r\n")).status,
+        403
+    );
+    let login = get(&format!("/machines?keep=1&t={token}"), "");
+    assert_eq!(login.status, 303);
+    assert_eq!(login.header("Location"), "/machines?keep=1");
+    let cookie = login.header("Set-Cookie").to_owned();
+    assert!(
+        cookie.contains("HttpOnly")
+            && cookie.contains("SameSite=Strict")
+            && cookie.contains("Secure")
+    );
+    assert!(!cookie.contains(&token));
+    let cookie = cookie.split(';').next().unwrap();
+    let cookie_header = format!("Cookie: {cookie}\r\n");
+    let page = get("/", &cookie_header);
+    assert_eq!(page.status, 200);
+    assert_eq!(page.header("X-Frame-Options"), "DENY");
+    assert_eq!(get("/", &bearer).status, 200);
+    assert_eq!(get(&format!("/?t={token}&%74={token}"), "").status, 403);
+    let host = url.strip_prefix("http://").unwrap();
+    assert_eq!(
+        http(&url, "POST", "/v1/push/status", host, &bearer, "{}").status,
+        401
+    );
+    assert_eq!(
+        http(&url, "POST", "/v1/pair", host, &bearer, "{}").status,
+        403
+    );
+    let (code, _) =
+        semon_push::simple_pair::issue(&fixture.dir(), semon_push::simple_pair::now().unwrap())
+            .unwrap();
+    let pairing = json!({"version":1,"code":code.expose(),"machine_id":"machine-6754a9c1e83f27b4","hostname":"laptop"}).to_string();
+    assert_eq!(
+        http(
+            &url,
+            "POST",
+            "/v1/pair",
+            host,
+            "Authorization:\r\n",
+            &pairing
+        )
+        .status,
+        403
+    );
+    assert_eq!(get(&format!("/?t={}", code.expose()), "").status, 403);
+    // Four body-stalled Viewer clients share the tunnel peer with a push.
+    // Read 100 Continue to prove each has passed Viewer admission before opening the next.
+    let mut slow = Vec::new();
+    for _ in 0..4 {
+        use std::io::{Read, Write};
+        let mut socket = std::net::TcpStream::connect(host).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(socket, "POST /api/viewer/home HTTP/1.1\r\nHost: history.example\r\n{bearer}Content-Length: 100\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        let mut interim = [0; 25];
+        socket.read_exact(&mut interim).unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        slow.push(socket);
+    }
+    assert_eq!(
+        http(
+            &url,
+            "POST",
+            "/v1/push/status",
+            host,
+            &format!("Authorization: Bearer {push_token}\r\n"),
+            "{}"
+        )
+        .status,
+        400
+    );
+    drop(slow);
+    let revoked = semon()
+        .args(["token", "--dir"])
+        .arg(fixture.dir())
+        .args(["--revoke", id])
+        .output()
+        .unwrap();
+    assert_ok(&revoked, "revoke read token while receiver runs");
+    assert_eq!(get("/", &cookie_header).status, 401);
+    assert_eq!(get("/", &bearer).status, 401);
+}
+
+#[test]
 fn push_mirrors_a_home_into_semon_receive() {
     let mut fixture = Fixture::new();
     let dir = fixture.dir();
@@ -324,6 +483,30 @@ fn push_mirrors_a_home_into_semon_receive() {
     assert!(!machine.join("claude/settings.json").exists());
     let facts = semon_sessions::read_facts(&machine.join("facts.json")).unwrap();
     assert_eq!(facts.hostname, "laptop");
+
+    // The same receive port serves retained received history, with its own read credential.
+    let (_, read_token) =
+        semon_push::read_tokens::create(&dir, semon_push::simple_pair::now().unwrap()).unwrap();
+    let response = http(
+        &url,
+        "GET",
+        "/api/tree",
+        url.strip_prefix("http://").unwrap(),
+        &format!("Authorization: Bearer {}\r\n", read_token.expose()),
+        "",
+    );
+    assert_eq!(response.status, 200);
+    let served: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(served["roots"].as_array().unwrap().len(), 2, "{served}");
+    for session in ["lane", "cx"] {
+        assert!(
+            served["roots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|root| root["id"] == session)
+        );
+    }
 
     // The native Viewer tree names both pushed sessions and their machine.
     let tree = fixture.tree();

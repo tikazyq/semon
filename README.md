@@ -114,10 +114,34 @@ The receiver can listen on plain HTTP behind an HTTPS proxy such as Cloudflare
 Tunnel. Start it and print a one-time code on the receiver host:
 
 ```sh
-semon receive --dir ~/semon-received --listen 0.0.0.0:8080
+semon receive --dir ~/semon-received --listen 127.0.0.1:8080 --public-url https://receiver.example
 # In another terminal on that host:
 semon pair --dir ~/semon-received
 ```
+
+Point the HTTPS tunnel or reverse proxy at that single port and preserve the
+public Host header. The same `receive` process serves the Viewer over received
+history; no separate `sessions --serve` process is needed. On the receiver host,
+create an owner read token:
+
+```sh
+semon token --dir ~/semon-received
+# Open https://receiver.example/?t=TOKEN using the printed token.
+semon token --dir ~/semon-received --list
+semon token --dir ~/semon-received --revoke TOKEN_ID
+```
+
+Creation prints the secret once to stdout and its ID to stderr. The registry
+stores only hashes and transactional create/revoke audit records. A successful
+login sets an HttpOnly, SameSite=Strict session cookie (Secure with an HTTPS
+public URL) and redirects away from `t`. Cookies are bound to read-token IDs;
+revocation is checked on every request. Cookies also end when the receiver
+restarts; sign in again with the read token. Scripts may instead send
+`Authorization: Bearer TOKEN`. Read tokens grant received-history reads only;
+push tokens and pair codes cannot sign in, and read tokens cannot push or pair.
+`--public-url` allows exactly its public Host and Origin in addition to loopback;
+forwarded headers do not expand this allowlist. Use an origin URL without a path,
+query, fragment or credentials.
 
 On each machine, use the public HTTPS URL and that code:
 
@@ -157,6 +181,7 @@ Its limits:
 - A request body is at most 6 MiB (one append's 4 MiB of file bytes, as base64, plus the JSON around it). A larger declared body gets 413 before any of it is read. A body needs a `Content-Length`: without one, or chunked, it gets 411.
 - The token is checked (401) before the body is read.
 - At most 32 connections at once. A connection that hasn't yet passed the token check also counts against its address (an IPv6 one by its /64), which may have 4 such; once a request on it is authenticated it counts only toward the 32, so machines behind one address (for example, behind a NAT) each keep their `--watch` connection. One more over either limit is closed as soon as it is accepted.
+- Viewer requests occupy at most half of the total connection cap (16 by default), release the peer's unauthenticated push allowance once classified, and close after their response. Slow Viewer reads and writes remain bounded by the receiver deadlines.
 - Every read and write, the TLS handshake's included, runs against a deadline, so trickling bytes doesn't stretch it. The first request's head must be in within 10 s of the connection being accepted, a later one's within 10 s of its first byte, and a body within 120 s. A kept-alive connection closes after 30 s idle, and no single read or write waits more than 30 s.
 - Each machine's copy holds at most 20 GiB (`--max-bytes SIZE`, as in `500G`), counted by a walk of `DIR/machines/` at start and then by each write. A push that would pass it gets 507, and `semon push` reports the failure and stops that pass. To recover, raise `--max-bytes` and restart the receiver. Deleting copies under `DIR` doesn't lower the count until a restart, and the machine sends deleted copies again anyway.
 - Paths are checked with `semon_sessions::is_input_path`. The receiver creates its directories itself and refuses a request whose path meets a symbolic link.
@@ -171,12 +196,14 @@ semon receive name machine-6754a9c1e83f27b4 --clear --dir ~/semon-machines
 ```
 
 Use the complete generated ID from the listing. Name changes are audited in the
-same registry transaction. Registry format 7 refuses older state explicitly;
+same registry transaction. Registry format 8 refuses older state explicitly;
 keep that directory unchanged and re-enroll into a new receiver directory.
 A received directory without a machine record is skipped with a re-enrollment warning; recorded machines remain available;
 Semon never deletes or moves retained logs.
 
-To see the received machines, serve `DIR` with `semon sessions --serve --machines DIR` ([See all your machines](#see-all-your-machines)).
+Browse received machines through the same `receive` URL using an owner read token.
+For a separate loopback-only view that can also include local history, use
+`semon sessions --serve --machines DIR` ([See all your machines](#see-all-your-machines)).
 
 ## See all your machines
 

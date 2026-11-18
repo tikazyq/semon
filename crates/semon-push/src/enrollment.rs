@@ -194,6 +194,8 @@ pub struct Registry {
     revision: u64,
     pub(crate) endpoint: Option<String>,
     pub(crate) simple_pair: crate::simple_pair::State,
+    pub(crate) read_tokens: Vec<crate::read_tokens::ReadToken>,
+    pub(crate) read_token_audit: Vec<crate::read_tokens::Audit>,
     pub(crate) machines: Vec<semon_sessions::received_registry::ReceivedMachine>,
     pub(crate) machine_audit: Vec<semon_sessions::received_registry::MachineAudit>,
     pub(crate) enrollments: Vec<Enrollment>,
@@ -211,6 +213,8 @@ impl Registry {
             format: FORMAT,
             revision: 0,
             simple_pair: crate::simple_pair::State::default(),
+            read_tokens: vec![],
+            read_token_audit: vec![],
             endpoint: None,
             machines: vec![],
             machine_audit: vec![],
@@ -296,6 +300,8 @@ impl Registry {
             format: FORMAT,
             revision: 0,
             simple_pair: crate::simple_pair::State::default(),
+            read_tokens: vec![],
+            read_token_audit: vec![],
             endpoint,
             machines: machine_records,
             machine_audit: vec![],
@@ -514,12 +520,14 @@ impl Registry {
             }
         }
         self.validate_simple_pair()?;
+        self.validate_read_tokens()?;
         crate::pairing::validate_receipts(self)?;
         self.validate_renewal()?;
         Ok(())
     }
     fn follows(&self, old: &Self) -> Result<()> {
         self.simple_pair_follows(old)?;
+        self.read_tokens_follow(old)?;
         if self.latest < old.latest || self.next_sequence < old.next_sequence {
             return Err(Error::Terminal);
         }
@@ -973,6 +981,7 @@ impl Store {
         if next.enrollments.len() > current.enrollments.len()
             || next.credentials.len() > current.credentials.len()
             || next.simple_pair.tokens.len() > current.simple_pair.tokens.len()
+            || next.read_tokens.len() > current.read_tokens.len()
         {
             next.check_admission()?;
         }
@@ -1003,6 +1012,7 @@ impl Store {
         if next.enrollments.len() > current.enrollments.len()
             || next.credentials.len() > current.credentials.len()
             || next.simple_pair.tokens.len() > current.simple_pair.tokens.len()
+            || next.read_tokens.len() > current.read_tokens.len()
         {
             next.check_admission()?;
         }

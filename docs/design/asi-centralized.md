@@ -69,6 +69,39 @@ amendment chooses no new journal format or authentication protocol. In this
 release only the receiver's OS owner reads, through the authenticated loopback
 Viewer, CLI and MCP; no login or multi-user ACL is added. [C1, C2, C6, I]
 
+## Receiver Viewer behind HTTPS (2026-11-18)
+
+The owner may expose received-history browsing through the same HTTPS tunnel or
+reverse proxy used for push. `semon receive --dir DIR --listen 127.0.0.1:8080
+--public-url https://receiver.example` owns one listener, dispatcher and connection
+cap. It embeds the existing received-machine Viewer handler; no internal proxy,
+second server or local-origin history is added. This amends the loopback-only
+reader decision above for the same OS owner's explicitly issued read credentials;
+it adds no accounts, tenant model or multi-user ACL.
+
+Run `semon token --dir DIR` on the receiver host and open
+`https://receiver.example/?t=TOKEN`. The read credential is independent of every
+push token and pair code. Issuance, listing and `--revoke ID` use the registry
+transaction lock; only hashes persist, with create/revoke audit entries. Registry
+format 8 replaces format 7 without migration; preserve old state and use a fresh
+receiver directory. Existing source records and native identity semantics remain.
+
+Login redirects to a URL without `t` and sets the existing HttpOnly,
+SameSite=Strict session cookie, Secure for an HTTPS public URL. A per-process MAC
+binds the cookie to its read-token ID; each request checks current registry
+custody and revocation. Restart requires another login. Bearer read clients use
+the same read-token table. Pair requests reject all Authorization headers.
+`--public-url` allows exactly the advertised public Host and Origin, plus
+loopback. The proxy must preserve public Host; forwarded headers do not grant
+additional authority. Existing Viewer security headers apply to every response.
+
+Viewer requests use at most half of the receiver's total connection cap and
+release their peer's unauthenticated push slot when classified. They close after
+one response and retain receiver read/write deadlines. A slow Viewer client
+behind the same tunnel peer therefore does not occupy that peer's push allowance.
+Push keep-alive and receiver framing/body limits remain unchanged. Receiver ASI
+SQL/materialization integration remains separate work.
+
 ## Four-action journey
 
 The owner decision on **2026-11-15** supersedes TLS-bound pairing with T3-style
@@ -132,7 +165,7 @@ multi-user or third-party receiver can revisit it without dormant runtime. [C2, 
   regardless of mode, without following a final symlink.
 - `connect` includes this ID in the committed pairing input, authenticated by the
   existing transcript and proof. The origin stores no additional identity state.
-- Registry format 7 retains `{id, directory, owner_name}` plus pairing state; `directory` equals the ID.
+- Registry format 8 retains `{id, directory, owner_name}` plus pairing state; `directory` equals the ID.
   Receiver storage is `machines/<machine-id>/`. Old state is refused: keep retained
   logs unchanged and re-enroll in a fresh receiver directory. No migration or deletion.
 - `receive enroll --machine NAME` supplies the starting owner display name only.

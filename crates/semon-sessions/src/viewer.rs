@@ -786,42 +786,72 @@ impl Viewer {
             .join("&");
         let query = routing_query.as_str();
         let if_none_match = request_header(&request, "If-None-Match").map(str::to_owned);
-        let reply = if path == "/api/viewer/home" && request.method() == &Method::Post {
-            let mut bytes = Vec::new();
-            let body = request
+        let mut bytes = Vec::new();
+        if request.method() == &Method::Post
+            && request
                 .as_reader()
                 .take(512 * 1024 + 1)
-                .read_to_end(&mut bytes);
-            let value = serde_json::from_slice::<Value>(&bytes);
-            if body.is_err()
-                || bytes.len() > 512 * 1024
-                || value
-                    .as_ref()
-                    .ok()
-                    .and_then(|value| value["seen"].as_array())
-                    .is_none()
-            {
+                .read_to_end(&mut bytes)
+                .is_err()
+        {
+            respond(
+                request,
                 json_reply(
                     400,
                     serde_json::json!({"error":"Invalid Home read arguments"}),
-                )
-            } else {
-                let value = value.unwrap();
-                let joined = format!(
-                    "{}{}seen={}",
-                    query,
-                    if query.is_empty() { "" } else { "&" },
-                    percent_encode(&value["seen"].to_string())
-                );
-                self.core.respond("GET", path, &joined, None)
-            }
-        } else {
-            self.core
-                .respond("GET", path, query, if_none_match.as_deref())
-        };
+                ),
+                None,
+            );
+            return;
+        }
+        let reply = handle_authorized(
+            &self.core,
+            request.method().as_str(),
+            path,
+            query,
+            &bytes,
+            if_none_match.as_deref(),
+        );
         respond(request, reply, set_cookie.then_some(&self.token));
     }
 }
+/// Serve an already authorized Viewer request. The embedding transport owns
+/// credentials, Host/Origin checks, framing and request deadlines.
+pub fn handle_authorized(
+    core: &ViewerCore,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    if_none_match: Option<&str>,
+) -> ViewerReply {
+    if path == "/api/viewer/home" && method == "POST" {
+        let value = serde_json::from_slice::<Value>(body);
+        if body.len() > 512 * 1024
+            || value
+                .as_ref()
+                .ok()
+                .and_then(|v| v["seen"].as_array())
+                .is_none()
+        {
+            return json_reply(
+                400,
+                serde_json::json!({"error":"Invalid Home read arguments"}),
+            );
+        }
+        let value = value.unwrap();
+        let joined = format!(
+            "{}{}seen={}",
+            query,
+            if query.is_empty() { "" } else { "&" },
+            percent_encode(&value["seen"].to_string())
+        );
+        core.respond("GET", path, &joined, None)
+    } else {
+        core.respond(method, path, query, if_none_match)
+    }
+}
+
 /// When a background check is next due, after one that started at
 /// `started` and a last rebuild that started at `built_at`: [`CHECK_EVERY`]
 /// after it, and never before [`REBUILD_SPACING`] after that rebuild.

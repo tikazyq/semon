@@ -62,6 +62,7 @@ impl Harness {
                 linger: Duration::ZERO,
                 ..Limits::default()
             },
+            viewer: None,
             admission: Mutex::new(Admission::default()),
             body: None,
             provisioning: Some(Arc::new(Mutex::new(controller))),

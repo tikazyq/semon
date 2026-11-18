@@ -398,6 +398,7 @@ mod tests {
                 .unwrap(),
             ),
             limits: Limits::default(),
+            viewer: None,
             admission: Mutex::new(Admission::default()),
             body: host,
             provisioning: None,

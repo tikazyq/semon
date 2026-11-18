@@ -14,7 +14,9 @@ enrollment_dir.mkdir(mode=0o700)
 token = secrets.token_hex(32)
 enrollment_id = secrets.token_hex(32)
 registry = {
-    "format": 7,
+    "format": 8,
+    "read_tokens": [],
+    "read_token_audit": [],
     "machines": [{"id": "machine-6754a9c1e83f27b4", "directory": "machine-6754a9c1e83f27b4", "owner_name": None}],
     "machine_audit": [],
     "simple_pair": {"pending": None, "burns": [], "pause_until": 0, "tokens": [], "audit": []},

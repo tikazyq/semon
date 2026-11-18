@@ -92,6 +92,7 @@ enum Command {
     Sessions(SessionsArgs),
     Push(PushArgs),
     Pair(Vec<String>),
+    Token(Vec<String>),
     Unpair(Vec<String>),
     Connect {
         endpoint: String,
@@ -297,6 +298,7 @@ fn parse_args() -> Result<Command, String> {
         }
         Some("push") => parse_push_args(arguments).map(Command::Push),
         Some("pair") => Ok(Command::Pair(arguments.collect())),
+        Some("token") => Ok(Command::Token(arguments.collect())),
         Some("unpair") => Ok(Command::Unpair(arguments.collect())),
         Some("receive") => parse_receive_args(arguments).map(Command::Receive),
         Some("query") => parse_query_command(arguments),
@@ -1069,6 +1071,7 @@ fn parse_receive_args(arguments: impl Iterator<Item = String>) -> Result<Receive
         arguments.next();
     }
     let mut advertise = None;
+    let mut public_url = None;
     let mut machine = None;
     let mut dir = None;
     let mut listen = semon_push::serve::DEFAULT_LISTEN.to_owned();
@@ -1087,6 +1090,7 @@ fn parse_receive_args(arguments: impl Iterator<Item = String>) -> Result<Receive
             "--tls-cert" => certificate = Some(PathBuf::from(value()?)),
             "--tls-key" => private_key = Some(PathBuf::from(value()?)),
             "--max-bytes" => max_bytes = parse_size(&value()?)?,
+            "--public-url" => public_url = Some(value()?),
             "--advertise" if enroll => advertise = Some(value()?),
             "--machine" if enroll => machine = Some(value()?),
             "-h" | "--help" => return Err(usage()),
@@ -1110,6 +1114,7 @@ fn parse_receive_args(arguments: impl Iterator<Item = String>) -> Result<Receive
         listen,
         tls,
         max_bytes,
+        public_url,
     };
     if enroll {
         Ok(ReceiveArgs::Enroll {
@@ -1336,6 +1341,7 @@ fn run(command: Command) -> Result<(), String> {
         Command::Sessions(args) => run_sessions(args),
         Command::Push(args) => run_push(&args),
         Command::Pair(args) => run_pair(&args),
+        Command::Token(args) => run_token(&args),
         Command::Unpair(args) => run_unpair(&args),
         Command::Connect {
             endpoint,
@@ -1667,6 +1673,49 @@ fn run_materialize(args: MaterializeArgs) -> Result<(), String> {
         interrupt::raise_received();
     }
     result
+}
+
+fn run_token(args: &[String]) -> Result<(), String> {
+    let mut args = args.iter();
+    let (mut dir, mut list, mut revoke) = (None, false, None);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dir" if dir.is_none() => {
+                dir = Some(PathBuf::from(args.next().ok_or("--dir requires DIR")?))
+            }
+            "--list" if !list && revoke.is_none() => list = true,
+            "--revoke" if !list && revoke.is_none() => {
+                revoke = Some(args.next().ok_or("--revoke requires ID")?)
+            }
+            _ => return Err("Usage: semon token --dir DIR [--list | --revoke ID]".into()),
+        }
+    }
+    let dir = dir.ok_or("token requires --dir DIR")?;
+    if list {
+        for token in semon_push::read_tokens::list(&dir).map_err(|e| e.to_string())? {
+            println!(
+                "{} created={} revoked={}",
+                token.id,
+                token.created_at,
+                token
+                    .revoked_at
+                    .map_or_else(|| "no".into(), |t| t.to_string())
+            );
+        }
+    } else if let Some(id) = revoke {
+        semon_push::read_tokens::revoke(&dir, id, semon_push::simple_pair::now()?)
+            .map_err(|e| e.to_string())?;
+        println!("Revoked read token {id}");
+    } else {
+        semon_push::simple_pair::initialize(&dir)?;
+        let (id, secret) = semon_push::read_tokens::create(&dir, semon_push::simple_pair::now()?)
+            .map_err(|e| e.to_string())?;
+        eprintln!(
+            "Read token ID: {id}; keep the token private. Open the receiver's URL with ?t=TOKEN to sign in."
+        );
+        println!("{}", secret.expose());
+    }
+    Ok(())
 }
 
 fn run_pair(args: &[String]) -> Result<(), String> {
@@ -2529,7 +2578,8 @@ fn usage() -> String {
          Usage: semon archive prune [--retention-days N] [--cache PATH]\n\
          Explicit archive maintenance. Omit retention to keep every chain indefinitely; native logs are never deleted.\n\
          \n\
-         Usage: semon receive --dir DIR [--listen ADDR] [--tls-cert PEM --tls-key PEM] [--max-bytes SIZE]\n\
+         Usage: semon receive --dir DIR [--listen ADDR] [--public-url URL] [--tls-cert PEM --tls-key PEM] [--max-bytes SIZE]\n\
+         Usage: semon token --dir DIR [--list | --revoke ID]\n\
          Usage: semon receive enroll --machine NAME --advertise HTTPS_URL --dir DIR [--listen ADDR] --tls-cert PEM --tls-key PEM\n\
          Usage: semon receive machines --dir DIR\n\
          Usage: semon receive name ID NAME --dir DIR\n\
