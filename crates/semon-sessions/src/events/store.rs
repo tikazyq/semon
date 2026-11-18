@@ -11032,21 +11032,19 @@ mod tests {
     #[test]
     fn inventory_replays_additions_removals_and_changes_behind_the_cursor() {
         use semon_asi::input::AdmittedSession;
-        use std::io::Write;
 
         let root = scratch("analytics-inventory-replay");
         let (options, rows, slots) = catalog_native_fixture(&root, 4, false);
         let path = super::super::EventCache::path(&options.cache);
         let (mut store, _) = opened(&path);
-        // Start without the first Claude session, so adding it later places it
-        // behind the cursor. Read the remaining Claude row and one Codex row.
-        let added = rows.iter().find(|row| row.key == "native-cl-00").unwrap();
-        let initial: Vec<_> = rows
-            .iter()
-            .filter(|row| row.key != added.key)
-            .cloned()
-            .collect();
-        catalog_write(&mut store, &initial, &slots, false, CatalogWriter::Auto).unwrap();
+        assert_eq!(
+            catalog_write(&mut store, &rows, &slots, false, CatalogWriter::Auto)
+                .unwrap()
+                .0,
+            Outcome::Written
+        );
+        // The two Claude keys sort first. We'll change the first, remove the
+        // second, and insert a new session whose key sorts between them.
         let mut reader = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
         let budget = analytics_budget(2, 100);
         let first = reader.read_admitted(None, budget).unwrap();
@@ -11070,43 +11068,46 @@ mod tests {
         };
         apply(&mut live, first.changes);
         drop(reader);
-        let changed = initial
+        let changed_uid = "fixture-machine/claude/native-cl-00";
+        let dropped_uid = "fixture-machine/claude/native-cl-02";
+        assert!(live.contains_key(changed_uid));
+        assert!(live.contains_key(dropped_uid));
+        let original = &rows
             .iter()
-            .find(|row| row.key == "native-cl-02")
-            .unwrap();
-        let changed_uid = "fixture-machine/claude/native-cl-02";
-        let old_steps = live[changed_uid].steps.len();
-        let mut source = fs::OpenOptions::new()
-            .append(true)
-            .open(&changed.sources[0].path)
-            .unwrap();
-        writeln!(source, "{}", serde_json::json!({
-            "type":"assistant","uuid":"new-answer","sessionId":"native-cl-02",
-            "timestamp":"2026-09-24T00:02:00Z","message":{"id":"new-msg",
-            "role":"assistant","model":"claude-sonnet-4-5",
-            "content":[{"type":"text","text":"Second answer"}],"usage":{"input_tokens":17,"output_tokens":6}}
-        })).unwrap();
-        drop(source);
+            .find(|row| row.key == "native-cl-00")
+            .unwrap()
+            .sources[0]
+            .path;
+        let added_key = "native-cl-00-added";
+        fs::write(
+            original.with_file_name(format!("{added_key}.jsonl")),
+            fs::read_to_string(original)
+                .unwrap()
+                .replace("native-cl-00", added_key),
+        )
+        .unwrap();
         let (rows, slots) = catalog_fixture_projection(&options);
-        catalog_write(&mut store, &rows, &slots, false, CatalogWriter::Auto).unwrap();
-        let dropped = rows
-            .iter()
-            .find(|row| row.native_ids[0] == "native-cx-01")
-            .unwrap();
+        assert!(rows.iter().any(|row| row.key == added_key));
+        assert_eq!(
+            catalog_write(&mut store, &rows, &slots, false, CatalogWriter::Auto)
+                .unwrap()
+                .0,
+            Outcome::Written
+        );
         let tx = store.connection.transaction().unwrap();
+        assert_eq!(tx.execute(
+            "UPDATE session_catalog SET metadata=json_set(metadata,'$.branch','replay-test') WHERE session_key='native-cl-00'",
+            [],
+        ).unwrap(), 1);
         tx.execute(
-            "DELETE FROM session_catalog WHERE session_key=?1",
-            [&dropped.key],
+            "INSERT INTO silver_change(session_key,kind) VALUES('native-cl-00','changed')",
+            [],
         )
         .unwrap();
-        tx.execute(
-            "DELETE FROM session_activity_projections WHERE session_key=?1",
-            [&dropped.key],
-        )
-        .unwrap();
-        tx.execute(
-            "INSERT INTO silver_change(session_key,kind) VALUES(?1,'removed')",
-            [&dropped.key],
+        tx.execute_batch(
+            "DELETE FROM session_catalog WHERE session_key='native-cl-02';
+             DELETE FROM session_activity_projections WHERE session_key='native-cl-02';
+             INSERT INTO silver_change(session_key,kind) VALUES('native-cl-02','removed');",
         )
         .unwrap();
         tx.commit().unwrap();
@@ -11130,9 +11131,12 @@ mod tests {
         apply(&mut expected, one.changes);
         assert_eq!(live, expected);
         assert_eq!(complete, one.reconciliation);
-        assert!(live.contains_key("fixture-machine/claude/native-cl-00"));
-        assert!(live[changed_uid].steps.len() > old_steps);
-        assert!(!live.contains_key("fixture-machine/codex/native-cx-01"));
+        assert!(live.contains_key(&format!("fixture-machine/claude/{added_key}")));
+        assert_eq!(
+            live[changed_uid].session.branch.as_deref(),
+            Some("replay-test")
+        );
+        assert!(!live.contains_key(dropped_uid));
         drop(reader);
         drop(store);
         fs::remove_dir_all(root).unwrap();
