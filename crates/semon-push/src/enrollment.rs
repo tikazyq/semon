@@ -201,6 +201,7 @@ pub struct Registry {
     pub(crate) renewal_receipts: Vec<crate::renewal::Receipt>,
     pub(crate) renewal_admission: Vec<crate::renewal::Admission>,
     pub(crate) tombstones: Vec<Tombstone>,
+    pub(crate) push_pairing: crate::push_pairing::State,
     pub(crate) latest: u64,
     pub(crate) next_sequence: u64,
 }
@@ -218,6 +219,7 @@ impl Registry {
             renewal_receipts: vec![],
             renewal_admission: vec![],
             tombstones: vec![],
+            push_pairing: Default::default(),
             latest: 0,
             next_sequence: 1,
         }
@@ -302,6 +304,7 @@ impl Registry {
             renewal_receipts: vec![],
             renewal_admission: vec![],
             tombstones: vec![],
+            push_pairing: Default::default(),
             latest: 0,
             next_sequence,
         };
@@ -512,13 +515,18 @@ impl Registry {
         }
         crate::pairing::validate_receipts(self)?;
         self.validate_renewal()?;
+        if !self.push_pairing.valid(self) {
+            return Err(Error::Invalid);
+        }
         Ok(())
     }
     fn follows(&self, old: &Self) -> Result<()> {
         if self.latest < old.latest || self.next_sequence < old.next_sequence {
             return Err(Error::Terminal);
         }
-        if !self.machine_audit.starts_with(&old.machine_audit) {
+        if !self.machine_audit.starts_with(&old.machine_audit)
+            || !self.push_pairing.follows(&old.push_pairing)
+        {
             return Err(Error::Terminal);
         }
         for machine in &old.machines {

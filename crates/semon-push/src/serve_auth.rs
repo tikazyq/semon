@@ -225,6 +225,18 @@ impl RegistryAuthenticator {
             }
         }
     }
+    pub(super) fn paired_machine(&self, authorization: Option<&str>) -> Option<String> {
+        let bearer = authorization?.strip_prefix("Bearer ")?;
+        if bearer.len() != 64 {
+            return None;
+        }
+        enrollment::refuse_legacy_tokens(&self.dir).ok()?;
+        let registry = Registry::read_current(&self.dir).ok()?;
+        registry
+            .push_pairing
+            .machine(&Secret::new(bearer.to_owned()).hash())
+    }
+
     /// Current state is read for every request; callers never receive local diagnostics.
     pub fn authenticated_enrollment(
         &self,
@@ -346,7 +358,7 @@ impl Authenticator {
     }
     pub(super) fn count(&self) -> Result<usize, String> {
         Registry::read_current(&self.0.dir)
-            .map(|r| r.credentials().len())
+            .map(|r| r.credentials().len() + r.push_pairing.count())
             .map_err(|e| e.to_string())
     }
     #[cfg(test)]

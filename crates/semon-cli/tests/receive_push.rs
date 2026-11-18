@@ -98,8 +98,12 @@ impl Fixture {
 
     /// Starts `semon receive` on a free loopback port and returns its URL.
     fn start_receiver(&mut self) -> String {
+        self.start_receiver_on("127.0.0.1:0")
+    }
+
+    fn start_receiver_on(&mut self, listen: &str) -> String {
         let mut child = semon()
-            .args(["receive", "--listen", "127.0.0.1:0", "--dir"])
+            .args(["receive", "--listen", listen, "--dir"])
             .arg(self.dir())
             .env("HOME", self.path("home"))
             .stdout(Stdio::null())
@@ -184,6 +188,10 @@ impl Fixture {
     /// `semon push` from the synthetic home.
     fn push(&self, url: &str) -> Output {
         self.install_origin(url);
+        self.push_with_defaults()
+    }
+
+    fn push_with_defaults(&self) -> Output {
         let home = self.path("home");
         semon()
             .args(["push"])
@@ -622,4 +630,69 @@ fn enroll_refuses_legacy_tokens_before_terminal_or_custody_initialization() {
     assert!(stderr(&output).contains("fresh receiver directory"));
     assert_eq!(std::fs::read(dir.join("tokens")).unwrap(), tokens);
     assert!(!dir.join("receiver.json").exists());
+}
+
+#[test]
+fn pair_push_and_unpair_through_cli() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut f = Fixture::new();
+    let claude = claude("paired from CLI");
+    f.write(&format!("home/{LOG}"), claude.as_bytes());
+    let issue = semon()
+        .args(["pair", "--dir"])
+        .arg(f.dir())
+        .output()
+        .unwrap();
+    assert_ok(&issue, "issue pairing code");
+    let code = std::str::from_utf8(&issue.stdout).unwrap().trim();
+    let bound = f.start_receiver_on("0.0.0.0:0");
+    assert!(bound.starts_with("http://0.0.0.0:"));
+    let url = bound.replace("0.0.0.0", "localhost");
+    let origin = || {
+        let mut command = semon();
+        command
+            .env("HOME", f.path("home"))
+            .env("XDG_CONFIG_HOME", f.path("config"));
+        command
+    };
+    let rejected = origin().args(["pair", &bound, code]).output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("loopback"));
+    let paired = origin().args(["pair", &url, code]).output().unwrap();
+    assert_ok(&paired, "redeem pairing code");
+    assert!(String::from_utf8_lossy(&paired.stdout).contains("`semon push`"));
+    let config = f.path("config/semon/origin/pair.json");
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let config_value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(config_value["url"], url);
+    let pushed = f.push_with_defaults();
+    assert_ok(&pushed, "push using pair.json");
+    let id = fs::read_to_string(f.path("config/semon/machine-id")).unwrap();
+    let id = id.trim();
+    let copy = f.dir().join("machines").join(id).join(LOG);
+    assert_eq!(fs::read(&copy).unwrap(), claude.as_bytes());
+    let revoked = semon()
+        .args(["unpair", "--dir"])
+        .arg(f.dir())
+        .arg(id)
+        .output()
+        .unwrap();
+    assert_ok(&revoked, "revoke pairing on receiver");
+    f.append(&format!("home/{LOG}"), assistant("revoked").as_bytes());
+    let refused = f.push_with_defaults();
+    assert!(!refused.status.success(), "revoked push was accepted");
+    assert!(
+        stderr(&refused).contains("refused the token"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(fs::read(copy).unwrap(), claude.as_bytes());
+    let forgotten = origin().arg("unpair").output().unwrap();
+    assert_ok(&forgotten, "forget pairing on origin");
+    assert!(!config.exists());
 }

@@ -8,7 +8,7 @@ cleanup is authorized by this contract.
 ## Architecture
 
 Origins send selected, redacted native logs using the existing `semon push` →
-`semon receive` [mirror contract](../mirror-protocol.md). The receiver indexes
+`semon receive` [push contract](../push-protocol.md). The receiver indexes
 those logs, materializes ASI, runs analytics/SQL/search and serves transcripts
 locally. It is the durable custodian of the selected redacted session text.
 Origin availability is required for new uploads, not for reading retained copies.
@@ -22,8 +22,10 @@ Incomplete inputs do not justify deleting or resetting retained history. [C1, I]
 
 ## Custody and privacy
 
-The origin authorizes **export**, through pairing plus explicit source consent.
-The combined approval says that this receiver keeps redacted native text and may
+The origin authorizes **export**. With push pairing, the origin pairs and runs
+`semon push` to send supported inputs. TLS-bound enrollment retains its separate
+source approval.
+The TLS-bound approval says that this receiver keeps redacted native text and may
 read it locally, including while the origin is offline. Narrowing the source set
 is available in that same interaction. Preserve separate persisted source consent;
 renewal cannot widen it and future sources need explicit approval. Disconnect or
@@ -33,7 +35,7 @@ already exported. Deletion is an explicit operator action. [C1, C4, M, I]
 Use the shipped sender redactor and supported input allowlist. Redaction is best
 effort, not proof of secret removal. Own-machine reads have **no zero-findings scan
 gate**. The old P1 exclusion of raw replicas and online body/cache policy no longer
-apply to this default. Export still requires source consent and preserves source
+apply to this default. Export still requires origin authorization and preserves source
 integrity; receiver custody grants no hosted-model or Hub body egress. [C1, C5, M, I]
 
 Recommend receiver **full-disk encryption and encrypted backups** as the at-rest
@@ -138,7 +140,7 @@ multi-user or third-party receiver can revisit it without dormant runtime. [C2, 
   regardless of mode, without following a final symlink.
 - `connect` includes this ID in the committed pairing input, authenticated by the
   existing transcript and proof. The origin stores no additional identity state.
-- Registry format 6 records `{id, directory, owner_name}`; `directory` equals the ID.
+- Registry format 7 records `{id, directory, owner_name}`; `directory` equals the ID.
   Receiver storage is `machines/<machine-id>/`. Old state is refused: keep retained
   logs unchanged and re-enroll in a fresh receiver directory. No migration or deletion.
 - `receive enroll --machine NAME` supplies the starting owner display name only.
@@ -170,5 +172,5 @@ All new mechanisms above use these sources; no historical document overrides the
 | C4 | Owner, **2026-11-14**: UX/DX primary; four setup actions, combined narrowing/approval, automatic push, two processes; service install separately counted. |
 | C6 | Owner, **2026-11-15**: decisions A–D above (proven-duplicate accounting, generated canonical machine ID with hostname/optional-name grouping (amended: no linking), receiver-wide refusal cap, loopback-owner readers only). |
 | C5 | Owner, **2026-11-14**: private-root/LAN pairing deferred, pinned invitation removed (#680), no zero-findings scan gate for own-machine reads. |
-| M | Shipped [mirror](../mirror-protocol.md), [enrollment and renewal](asi-enrollment.md): source allowlist/redaction, export consent, transport authentication, credential custody and current trust lifecycle. |
+| M | Shipped [mirror](../push-protocol.md), [enrollment and renewal](asi-enrollment.md): source allowlist/redaction, export consent, transport authentication, credential custody and current trust lifecycle. |
 | I | [Repository invariants](../../AGENTS.md): native identity/lineage/provenance, source integrity and custody, body-free analytics/Hub, parser behavior, one current format, preserved frozen/user data and Viewer ownership/security. |

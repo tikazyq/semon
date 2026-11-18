@@ -1009,7 +1009,7 @@ impl CacheDirectory {
     }
 
     /// Cleanup must unlink even when the failing operation was directory fsync.
-    fn unlink(&self, path: &Path) -> Result<()> {
+    pub(crate) fn unlink(&self, path: &Path) -> Result<()> {
         let name = Self::name(path)?;
         // SAFETY: the filename is validated and the pinned directory fd is live.
         if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } != 0 {

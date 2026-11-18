@@ -199,7 +199,11 @@ impl ReceiverCustody {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| Error::Invalid)?
             .as_secs();
-        Self::open_with_clock(dir, || Ok(()), |_| {}, now, endpoint)
+        Self::open_with_clock(dir, || Ok(()), |_| {}, now, Some(endpoint))
+    }
+    pub(crate) fn initialize_for_push(dir: &Path) -> Result<Self> {
+        let now = crate::origin_custody::now().map_err(|_| Error::Invalid)?;
+        Self::open_with_clock(dir, || Ok(()), |_| {}, now, None)
     }
     #[cfg(test)]
     fn open_with_fault(dir: &Path, before_identity: impl FnOnce() -> Result<()>) -> Result<Self> {
@@ -220,7 +224,7 @@ impl ReceiverCustody {
             before_identity,
             locked,
             now,
-            "https://receiver.example:443",
+            Some("https://receiver.example:443"),
         )
     }
     #[cfg(test)]
@@ -229,16 +233,19 @@ impl ReceiverCustody {
     }
     #[cfg(test)]
     pub(crate) fn open_at_endpoint(dir: &Path, now: u64, endpoint: &str) -> Result<Self> {
-        Self::open_with_clock(dir, || Ok(()), |_| {}, now, endpoint)
+        Self::open_with_clock(dir, || Ok(()), |_| {}, now, Some(endpoint))
     }
     fn open_with_clock(
         dir: &Path,
         before_identity: impl FnOnce() -> Result<()>,
         locked: impl FnOnce(&File),
         now: u64,
-        endpoint: &str,
+        endpoint: Option<&str>,
     ) -> Result<Self> {
-        let endpoint = crate::pairing::normalize_endpoint(endpoint).map_err(|_| Error::Invalid)?;
+        let endpoint = endpoint
+            .map(crate::pairing::normalize_endpoint)
+            .transpose()
+            .map_err(|_| Error::Invalid)?;
         if !dir.try_exists().map_err(|_| Error::Custody)? {
             fs::DirBuilder::new()
                 .mode(0o700)
@@ -282,11 +289,13 @@ impl ReceiverCustody {
             // Registry owns its own directory, lock and durable format.
             let mut store =
                 enrollment::Store::initialize_at(&root.fd).map_err(|_| Error::Custody)?;
-            let mut registry = store.snapshot().map_err(|_| Error::Custody)?;
-            registry.endpoint = Some(endpoint);
-            store
-                .commit(registry.revision(), &registry)
-                .map_err(|_| Error::Custody)?;
+            if let Some(endpoint) = endpoint {
+                let mut registry = store.snapshot().map_err(|_| Error::Custody)?;
+                registry.endpoint = Some(endpoint);
+                store
+                    .commit(registry.revision(), &registry)
+                    .map_err(|_| Error::Custody)?;
+            }
             drop(store);
             // MemoryKey takes ownership; the additional seed copy is zeroized too.
             let seed = random_secret()?;

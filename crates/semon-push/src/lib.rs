@@ -1,4 +1,4 @@
-//! `semon push`: a client of the mirror protocol (docs/mirror-protocol.md).
+//! `semon push`: a client of the mirror protocol (docs/push-protocol.md).
 //! It keeps a receiver's copy of this machine's session logs in step with
 //! the originals, appending as they grow, and sends the machine's facts.
 //!
@@ -84,6 +84,8 @@ pub mod provision;
 #[cfg(unix)]
 pub mod provision_wire;
 #[cfg(unix)]
+pub mod push_pairing;
+#[cfg(unix)]
 pub mod receiver_acl;
 #[cfg(unix)]
 pub mod receiver_audit;
@@ -132,7 +134,7 @@ pub type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Debug)]
 pub struct PushOptions {
-    /// The receiver's base URL; requests go to `<url>/v1/mirror/…`.
+    /// The receiver's base URL; requests go to `<url>/v1/push/…`.
     pub url: String,
     pub credential: Credential,
     pub sessions: Options,
@@ -274,34 +276,22 @@ pub fn read_token(path: &Path) -> Result<String> {
 /// no query or fragment. Returns it normalised: the scheme and host in
 /// lower case, and no trailing slash.
 pub fn check_url(url: &str) -> Result<String> {
-    let url = url.trim_end_matches('/');
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| format!("{url} is not a URL"))?;
-    let scheme = scheme.to_ascii_lowercase();
-    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let path = &rest[host.len()..];
-    let host = host.to_ascii_lowercase();
-    let host = host.as_str();
-    let normal = format!("{scheme}://{host}{path}");
-    let hostname = host
-        .rsplit_once(':')
-        .filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
-        .map_or(host, |(name, _)| name);
-    if host.is_empty() || host.contains('@') {
-        return Err(format!("{url}: no host, or credentials in the URL"));
+    let parsed = reqwest::Url::parse(url).map_err(|_| "invalid receiver URL")?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host().is_none()
+    {
+        return Err("receiver URL must have a host and no credentials, query or fragment".into());
     }
-    if url.contains(['?', '#']) {
-        return Err(format!("{url}: no query or fragment allowed"));
+    match parsed.scheme() {
+        "https" => {}
+        "http" if parsed.host_str().is_some_and(loopback) => {}
+        "http" => return Err("plain http is allowed to a loopback address only".into()),
+        _ => return Err("the receiver URL must be https".into()),
     }
-    match scheme.as_str() {
-        "https" => Ok(normal),
-        "http" if loopback(hostname) => Ok(normal),
-        "http" => Err(format!(
-            "{url}: plain http is allowed to a loopback address only"
-        )),
-        _ => Err(format!("{url}: the URL must be https")),
-    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 /// `localhost`, `[::1]` or any address in 127.0.0.0/8.
@@ -311,6 +301,23 @@ fn loopback(host: &str) -> bool {
         || host
             .parse::<std::net::Ipv4Addr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+fn http_transport(
+    http: reqwest::blocking::ClientBuilder,
+    url: &str,
+) -> reqwest::blocking::ClientBuilder {
+    if url.starts_with("http://") {
+        http.no_proxy().resolve_to_addrs(
+            "localhost",
+            &[
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+            ],
+        )
+    } else {
+        http
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,10 +495,11 @@ impl Client {
         let url = check_url(&options.url)?;
         options.credential.token()?;
         let credential = options.credential.clone();
+        let transport_url = url.clone();
         let http: Arc<HttpFactory> = Arc::new(move |selected| {
             let credential = selected.as_ref().unwrap_or(&credential);
             let token = credential.token()?;
-            let http = builder();
+            let http = http_transport(builder(), &transport_url);
             #[cfg(unix)]
             let http = match &credential {
                 Credential::MutualTls { identity, .. }
@@ -629,7 +637,7 @@ impl Client {
         let mut retries = 0;
         loop {
             let factory = Arc::clone(&self.http);
-            let request_url = format!("{}/v1/mirror/{route}", self.url);
+            let request_url = format!("{}/v1/push/{route}", self.url);
             let body = body.clone();
             let lock = self.lock.clone();
             let dispatch_stop = self.stop.clone();
@@ -2182,7 +2190,7 @@ mod tests {
             for mut request in worker.incoming_requests() {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
-                let response = if request.url() == "/v1/mirror/append" {
+                let response = if request.url() == "/v1/push/append" {
                     match serde_json::from_str::<Append>(&body) {
                         Ok(append) => {
                             let length = append.offset
@@ -2237,7 +2245,7 @@ mod tests {
         );
         thread::spawn(move || {
             for mut request in worker.incoming_requests() {
-                assert_eq!(request.url(), "/v1/mirror/append");
+                assert_eq!(request.url(), "/v1/push/append");
                 let mut body = Vec::new();
                 request.as_reader().read_to_end(&mut body).unwrap();
                 let mut append: Append = serde_json::from_slice(&body).unwrap();
@@ -2510,7 +2518,7 @@ mod tests {
                 let mut cold_after_fresh = 0;
                 for mut request in listener.incoming_requests() {
                     if request.method() == &tiny_http::Method::Head {
-                        assert_eq!(request.url(), "/v1/mirror/status");
+                        assert_eq!(request.url(), "/v1/push/status");
                         request
                             .respond(
                                 Response::empty(405)
@@ -2522,7 +2530,7 @@ mod tests {
                     let mut body = Vec::new();
                     request.as_reader().read_to_end(&mut body).unwrap();
                     match request.url() {
-                        "/v1/mirror/append" => {
+                        "/v1/push/append" => {
                             let append: Append = serde_json::from_slice(&body).unwrap();
                             if append.path == "projects/-work/pending.jsonl"
                                 && history_acks == 0
@@ -2553,7 +2561,7 @@ mod tests {
                                 .respond(Response::from_string(answer.body.to_string()))
                                 .unwrap();
                         }
-                        "/v1/mirror/status" => {
+                        "/v1/push/status" => {
                             let observation: wire::Status = serde_json::from_slice(&body).unwrap();
                             let answer = sink.handle("fixture", mirror::Endpoint::Status, &body);
                             assert_eq!(answer.status, 200);
@@ -2745,7 +2753,7 @@ mod tests {
                     .unwrap()
                     .expect("initial append or optional status");
                 if request.method() == &tiny_http::Method::Head {
-                    assert_eq!(request.url(), "/v1/mirror/status");
+                    assert_eq!(request.url(), "/v1/push/status");
                     request
                         .respond(
                             Response::empty(405)
@@ -2755,13 +2763,13 @@ mod tests {
                     continue;
                 }
                 match request.url() {
-                    "/v1/mirror/append" => {
+                    "/v1/push/append" => {
                         request
                             .respond(Response::from_string(body).with_status_code(status))
                             .unwrap();
                         break;
                     }
-                    "/v1/mirror/status" => {
+                    "/v1/push/status" => {
                         let mut input = String::new();
                         request.as_reader().read_to_string(&mut input).unwrap();
                         let observation: wire::Status = serde_json::from_str(&input).unwrap();
@@ -2782,7 +2790,7 @@ mod tests {
                     .unwrap()
                     .expect("restricted-pass status heartbeat");
                 if request.method() == &tiny_http::Method::Head {
-                    assert_eq!(request.url(), "/v1/mirror/status");
+                    assert_eq!(request.url(), "/v1/push/status");
                     request
                         .respond(
                             Response::empty(405)
@@ -2793,7 +2801,7 @@ mod tests {
                 }
                 assert_eq!(
                     request.url(),
-                    "/v1/mirror/status",
+                    "/v1/push/status",
                     "no append retry or premature full facts while restricted"
                 );
                 let mut input = String::new();
@@ -2970,7 +2978,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap()
                 .expect("legacy generation negotiation");
-            assert_eq!(request.url(), "/v1/mirror/append");
+            assert_eq!(request.url(), "/v1/push/append");
             let mut input = String::new();
             request.as_reader().read_to_string(&mut input).unwrap();
             let append: Append = serde_json::from_str(&input).unwrap();
@@ -3079,7 +3087,7 @@ mod sync_status_tests {
 
     fn answer_status_head(request: tiny_http::Request) -> Option<tiny_http::Request> {
         if request.method() == &tiny_http::Method::Head {
-            assert_eq!(request.url(), "/v1/mirror/status");
+            assert_eq!(request.url(), "/v1/push/status");
             request
                 .respond(
                     Response::empty(405)

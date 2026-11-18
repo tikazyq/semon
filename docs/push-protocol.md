@@ -1,12 +1,13 @@
-# The mirror protocol
+# The push protocol
 
 `semon push` keeps a copy of this machine's session logs on another server, a *receiver*, and sends it the machine's facts, so `semon-sessions` can discover, index and query those native sources using the recorded facts (`Options::facts`). This document is the whole contract: any server that implements it can receive a push.
 
 `semon receive` is the reference receiver (`semon_push::mirror::Receiver`, see the README's "Receive pushes from your other machines"). It keeps each machine's copy under `DIR/machines/<machine-id>/`, and caps a request body at 6 MiB: one append's 4 MiB of file bytes as base64, plus the JSON around it. Beyond the answers below, it may answer 411 (no `Content-Length`) and 507 (the machine's copy would pass its size cap); a client treats either as a failure.
 
-Registry format 6 stores the origin-generated canonical machine ID
+Registry format 7 stores the origin-generated canonical machine ID
 (`machine-<8 lowercase hex Unix seconds><8 secure random hex digits>`), its
-identical directory locator and optional owner display name. `connect` commits
+identical directory locator and optional owner display name. It also records
+push-pairing state, Bearer hashes and the push-pairing audit. `connect` commits
 the origin ID into the authenticated pairing input. The receiver creates
 `machines/<machine-id>/`; re-pairing that ID replaces its enrollment. The enroll
 NAME initializes only a new record's owner name; equal names group presentation.
@@ -16,20 +17,49 @@ a re-enrollment warning. Missing/unsupported registry refuses the received set.
 Old state requires a fresh receiver directory and re-enrollment; retained logs
 are never migrated, moved or deleted.
 
-The reference receiver requires the current enrollment registry and a separate
-`mirror_push` bearer credential scoped to one machine. `connect` installs the
-Push client's protected input for that kind bearer; a bearer is machine transport
-authority, never user identity or source authority. Legacy `DIR/tokens` state and
-`receive token` commands are refused; preserve old tokens/history and explicitly
-re-pair through the enrollment flow in a fresh receiver directory. No import, conversion or deletion occurs.
+Both push pairing and TLS-bound enrollment issue kind `push` Bearers scoped to
+one machine. A Bearer authorizes writing that machine's copy. Legacy `DIR/tokens`
+state and `receive token` commands are refused. Preserve old state and re-pair
+in a fresh directory.
+
+### Push pairing
+
+`semon pair --dir DIR` creates one pending code with 256 bits of randomness,
+encoded as 64 hex characters. It replaces any previous pending code. The
+registry stores its SHA-256 digest and expiry (10 minutes). The holder of a live
+code is trusted to claim the submitted machine ID. Share it only with a machine
+operator you trust.
+
+`semon pair URL CODE` sends `POST <url>/v1/push/pair` with `Content-Type:
+application/json`, `Content-Length` and a body of at most 1 KiB. No `Authorization`
+header is needed. The JSON object contains exactly two string fields, `machine`
+(the canonical ID) and `code`. Invalid JSON or an invalid machine ID gets 400.
+Missing length or chunked framing gets 411. A larger declared body gets 413.
+
+The first validly formed submission consumes the pending code. A mismatched
+code before expiry also pauses issuance for 60 seconds. Pending code, pause and
+credential changes use the same registry transaction. Expired, consumed or
+wrong codes get 401. Successful redemption returns 200 and `{"bearer":"…"}`
+with `Cache-Control: no-store`. The Bearer has 256 random bits, never expires on
+its own, and replaces any previous push-pairing Bearer for that ID. The registry
+stores only its SHA-256 digest. Pair, replacement and revocation are audited.
+`semon unpair --dir DIR MACHINE_ID` removes that Bearer and preserves logs and
+machine metadata. `semon unpair` on the origin removes the local pairing file.
+
+The client atomically replaces its mode-0600 `pair.json` in its private origin
+configuration directory. It contains `url` and `bearer`. Plain `semon push`
+selects this file first. `--receiver URL` selects TLS-bound enrollment.
+
+### TLS-bound enrollment
+
 Local receiver enrollment starts with `receive enroll --machine NAME --advertise
-HTTPS_URL --dir DIR --tls-cert PEM --tls-key PEM`; origin `connect --to HTTPS_URL`
-confirms the code and trust/source summary and atomically installs mirror custody.
-A kept-alive connection cannot switch enrollments.
+HTTPS_URL --dir DIR --tls-cert PEM --tls-key PEM`. Origin `connect --to HTTPS_URL`
+confirms the code and trust/source summary and atomically installs origin custody.
+A kept-alive connection using TLS-bound enrollment cannot switch enrollments.
 
 The reference receiver takes an exclusive, non-blocking OS lock on its store directory for its lifetime. A second receiver on that directory is refused at startup, so preservation and replacement cannot interleave across receiver instances.
 
-The generic mirror protocol is independent of the retired Encrypted Relay.
+The generic push protocol is independent of the retired Encrypted Relay.
 Mirrored content is readable by the receiver; sender redaction and HTTPS do not
 provide end-to-end encryption. A source mirror does not contain the complete
 workspace and native harness state required for independent recovery.
@@ -46,13 +76,17 @@ workspace and native harness state required for independent recovery.
 
 ## Requests
 
-All requests are `POST` with a JSON body and `Authorization: Bearer <token>`. `<url>` is the base URL the user gives `--to`. It must be `https`, except plain `http` to a loopback address (`localhost`, `[::1]`, 127.0.0.0/8).
+Delivery requests use `POST` with a JSON body and `Authorization: Bearer <token>`.
+Clients validate standard public CA trust and the hostname for HTTPS. Plain HTTP
+is allowed only to loopback (`localhost`, `[::1]`, 127.0.0.0/8). Clients do not
+follow redirects. The receiver may listen on HTTP behind a TLS-terminating proxy.
+Keep that listener reachable only over a trusted backend link.
 
 Request bodies currently use identity encoding. Response gzip/Brotli and sealed
 storage are independent. See [native archive transport and codec measurements](native-archive-transport.md)
 for the bounded archive reader, coexistence/restart rules and upload experiment.
 
-### `POST <url>/v1/mirror/append`
+### `POST <url>/v1/push/append`
 
 ```json
 {"root": "claude", "path": "projects/-work/abc.jsonl", "redactor_version": 1, "offset": 0, "head_sha256": "…", "bytes": "…", "replace": false}
@@ -72,7 +106,7 @@ Answers:
 - **409** `{"length": N, "head_sha256": "…"}`: not applied, because `offset` isn't the copy's length or the head doesn't match. `N` is the copy's current length, and `head_sha256` is the hash of its first `min(4096, N)` bytes.
 - **400**: the body or the path is invalid. **401**: the token is unknown or revoked. **413**: the body is too large.
 
-### `POST <url>/v1/mirror/facts`
+### `POST <url>/v1/push/facts`
 
 The body is a `Facts` object:
 
@@ -96,7 +130,7 @@ The answer is 200 when it is stored. A receiver that hasn't had facts for a whil
 - **409.** When the receiver's copy is the client's redacted file up to a line boundary (same length prefix, same head hash), the client resumes from the receiver's length. Otherwise it sends the file again with `replace`.
 - **Deleted files** are not deleted on the receiver.
 - **Cadence.** One complete pass and one facts post, then exit. With `--watch`, each sweep sends at most four complete redaction batches before waiting 2 s and discovering fresh targets. Recent/live batches and history retain the scheduler's three-to-one preference; a long line remains one indivisible redaction batch. Full facts are posted at most every 10 s, after a complete sweep only; a bounded partial sweep never commits a complete source inventory. Optional status heartbeats continue during backfill.
-- **Credential.** `semon connect --to HTTPS_URL [--machine NAME]` installs a mirror-only enrollment after mutually confirmed pairing and explicit terminal approval. `--receiver URL` also selects the endpoint on connect. `semon disconnect --receiver URL` disables only local use after terminal confirmation, retaining history, keys, consent and audits. `semon push [--receiver URL] [--watch]` reads its protected origin custody; it sends the bearer only in the `Authorization` header. The superseded push `--to`/`--token-file` CLI is removed.
+- **Credential.** `semon pair URL CODE` sets the default delivery credential. `semon connect --to HTTPS_URL [--machine NAME]` installs a mirror-only enrollment after mutually confirmed pairing and explicit terminal approval. `--receiver URL` also selects the endpoint on connect. `semon disconnect --receiver URL` disables only local use after terminal confirmation, retaining history, keys, consent and audits. `semon push [--receiver URL] [--watch]` reads its private configuration and sends the bearer only in the `Authorization` header. The superseded push `--to`/`--token-file` CLI is removed.
 
 ## Sealed copies on the receiver
 
@@ -104,7 +138,7 @@ A receiver may seal an idle copy to save space (`semon_sessions::sealed`). Its b
 
 ## Optional partial sync observations (status v1)
 
-`POST <url>/v1/mirror/status` is an optional extension, authenticated, admitted, size limited and scoped to the same machine as append and facts. Before posting status, a sender performs a cancellable bearer-authenticated HEAD capability request to that exact path, without following redirects, and requires 405 with `Allow: POST`. A cookie-gated 401/403 fallback, unknown route or other non-advertisement disables only this optional extension; append and full-facts refusals remain fatal. Once advertised, status POST token refusal is fatal, including subsequent revocation. A sender still disables status after POST 404 or 405, because an old generic HEAD handler can advertise POST globally. Successful status never lifts an append pause, storage restriction or retry delay. It does not replace `/facts`, delete retained copies, establish a complete collector selection or imply that an agent is executing.
+`POST <url>/v1/push/status` is an optional extension, authenticated, admitted, size limited and scoped to the same machine as append and facts. Before posting status, a sender performs a cancellable bearer-authenticated HEAD capability request to that exact path, without following redirects, and requires 405 with `Allow: POST`. A cookie-gated 401/403 fallback, unknown route or other non-advertisement disables only this optional extension; append and full-facts refusals remain fatal. Once advertised, status POST token refusal is fatal, including subsequent revocation. A sender still disables status after POST 404 or 405, because an old generic HEAD handler can advertise POST globally. Successful status never lifts an append pause, storage restriction or retry delay. It does not replace `/facts`, delete retained copies, establish a complete collector selection or imply that an agent is executing.
 
 ```json
 {"version":1,"observation_id":"0123456789abcdef0123456789abcdef","sequence":1,"observed_at_ms":1791539000000,"phase":"syncing","runtime":{"version":2,"hostname":"laptop","home":"/home/me","proc_starts":{},"codex_locks":{},"repos":{},"repo_ids":{}},"inventory_complete":true,"targets":[{"root":"codex","path":"sessions/native.jsonl","generation":"abcdef0123456789abcdef0123456789","target_bytes":12000,"acked_bytes":4096,"head_sha256":"…"}]}

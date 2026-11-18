@@ -271,7 +271,86 @@ fn append_body(path: &str, before: &[u8], offset: u64, bytes: &[u8]) -> Vec<u8> 
 }
 
 const LOG: &str = "projects/-work/lane.jsonl";
-const APPEND: &str = "/v1/mirror/append";
+const APPEND: &str = "/v1/push/append";
+
+#[test]
+fn push_pairing_routes_replace_and_revoke_machine_bearers() {
+    const PAIR: &str = "/v1/push/pair";
+    const MACHINE: &str = "machine-0000000000000001";
+    let (receiver, _) = receiving(&[]);
+    let addr = receiver.address;
+    let code = semon_push::push_pairing::issue(&receiver.dir).unwrap();
+    for invalid in [
+        json!({"machine": "../somewhere", "code": code.expose()}).to_string(),
+        json!({"machine": MACHINE, "code": code.expose(), "extra": false}).to_string(),
+        format!(
+            r#"{{"machine":"{MACHINE}","code":"{}","code":"again"}}"#,
+            code.expose()
+        ),
+        format!(
+            r#"{{"machine":"{MACHINE}","code":"{}"}} {{}}"#,
+            code.expose()
+        ),
+    ] {
+        assert_eq!(post(addr, PAIR, None, invalid.as_bytes()).status, 400);
+    }
+    let oversized = format!(
+        "POST {PAIR} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 1025\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(exchange(addr, oversized.as_bytes()).status, 413);
+    let redeem = |code: &Secret| {
+        post(
+            addr,
+            PAIR,
+            None,
+            &serde_json::to_vec(&json!({"machine": MACHINE, "code": code.expose()})).unwrap(),
+        )
+    };
+    let first = redeem(&code);
+    assert_eq!(first.status, 200);
+    assert_eq!(redeem(&code).status, 401);
+    let first = first.body["bearer"].as_str().unwrap();
+    let bytes = b"{}\n";
+    let append = append_body(LOG, b"", 0, bytes);
+    assert_eq!(
+        post(addr, "/v1/mirror/append", Some(first), &append).status,
+        401
+    );
+    assert_eq!(
+        post(addr, "/v1/analytics/publish", Some(first), b"{}").status,
+        401
+    );
+    assert_eq!(post(addr, APPEND, Some(first), &append).status, 200);
+    let code = semon_push::push_pairing::issue(&receiver.dir).unwrap();
+    let second = redeem(&code);
+    assert_eq!(second.status, 200);
+    let second = second.body["bearer"].as_str().unwrap();
+    let more = append_body(LOG, bytes, bytes.len() as u64, bytes);
+    assert_eq!(post(addr, APPEND, Some(first), &more).status, 401);
+    assert_eq!(post(addr, APPEND, Some(second), &more).status, 200);
+    // Malformed push bodies reach the corresponding decoders with active authority.
+    assert_eq!(
+        post(addr, "/v1/push/facts", Some(second), b"null").status,
+        400
+    );
+    assert_eq!(
+        post(addr, "/v1/push/status", Some(second), b"null").status,
+        400
+    );
+    semon_push::push_pairing::revoke(&receiver.dir, MACHINE).unwrap();
+    assert_eq!(post(addr, APPEND, Some(second), &more).status, 401);
+    let log = receiver
+        .dir
+        .join("machines")
+        .join(MACHINE)
+        .join("claude")
+        .join(LOG);
+    assert_eq!(fs::read(log).unwrap(), b"{}\n{}\n");
+    assert_eq!(
+        Registry::read_current(&receiver.dir).unwrap().machines()[0].id,
+        MACHINE
+    );
+}
 
 #[test]
 fn an_append_is_answered_over_http() {
@@ -344,7 +423,7 @@ fn unknown_and_revoked_tokens_are_401() {
     assert_eq!(
         post(
             receiving.address,
-            "/v1/mirror/facts",
+            "/v1/push/facts",
             Some(&tokens[0]),
             &facts
         )
@@ -355,7 +434,7 @@ fn unknown_and_revoked_tokens_are_401() {
     assert_eq!(
         post(
             receiving.address,
-            "/v1/mirror/facts",
+            "/v1/push/facts",
             Some(&tokens[1]),
             &facts
         )
@@ -405,9 +484,9 @@ fn only_post_to_the_two_endpoints() {
     assert!(answer.head.contains("Allow: POST"));
     for route in [
         "/",
-        "/v1/mirror",
-        "/v1/mirror/append/",
-        "/v1/mirror/append?x=1",
+        "/v1/push",
+        "/v1/push/append/",
+        "/v1/push/append?x=1",
         "/v1/frames",
     ] {
         assert_eq!(
@@ -434,7 +513,7 @@ fn malformed_bodies_are_400() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     let bodies: [&[u8]; 5] = [b"", b"{", b"[1,2]", b"\"text\"", b"\xff"];
     for body in bodies {
-        for route in [APPEND, "/v1/mirror/facts"] {
+        for route in [APPEND, "/v1/push/facts"] {
             let answer = post(receiving.address, route, Some(&tokens[0]), body);
             assert_eq!(answer.status, 400, "{route} {body:?}");
             assert!(answer.body["error"].is_string());
@@ -890,7 +969,7 @@ fn a_peer_that_never_reads_its_answer_is_closed_at_the_write_deadline() {
 fn status_head_advertises_post_without_body_and_unknown_routes_stay_unsupported() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     let head = format!(
-        "HEAD /v1/mirror/status HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        "HEAD /v1/push/status HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
         receiving.address, tokens[0]
     );
     let answer = exchange(receiving.address, head.as_bytes());
@@ -903,11 +982,11 @@ fn status_head_advertises_post_without_body_and_unknown_routes_stay_unsupported(
     );
     assert!(answer.body.is_null());
     assert_eq!(answer.body_bytes, 0, "HEAD must not send an error body");
-    let unknown = head.replace("/v1/mirror/status", "/v1/mirror/unknown-status");
+    let unknown = head.replace("/v1/push/status", "/v1/push/unknown-status");
     assert_eq!(exchange(receiving.address, unknown.as_bytes()).status, 401);
     let unauthorized = post(
         receiving.address,
-        "/v1/mirror/status",
+        "/v1/push/status",
         Some("revoked-token"),
         b"{}",
     );

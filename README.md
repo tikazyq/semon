@@ -92,7 +92,7 @@ The Viewer is also a library API: `semon_sessions::ViewerCore` serves native pag
 
 Server-rendered pages that share the viewer's visual language can use the documented shell contract in [docs/shell.md](docs/shell.md).
 
-`semon push [--receiver URL] [--watch]` keeps a copy of these logs on another server that implements the [mirror protocol](docs/mirror-protocol.md). It sends only supported native source files (`semon_sessions::inputs`), redacted on this machine before they leave (known secret shapes become `*`, byte for byte). It also sends this machine's facts: hostname, live processes, held Codex locks and repositories (`semon_sessions::local_facts`). A copy built with `--facts FILE` (or `Options::facts`) preserves the source machine’s recorded identity and runtime observations. Run `semon connect --to https://receiver.example:8735 --machine laptop` first; it installs private origin custody after code confirmation and explicit source approval. The client's cursor state is kept under `$XDG_STATE_HOME/semon/push/`, 0600. One push at a time runs with a state file: it holds an OS lock on `<state>.lock` beside it, and a second push with the same state (by default, to the same receiver URL, however its scheme, host case or trailing slash is spelled) fails at once until the first ends. Ctrl-C or SIGTERM ends a push, `--watch` included, within a moment, from wherever it was, with the state file recording what the receiver acknowledged. An app that embeds the push calls `semon_push::push_until` with a `Stop`, and can pass the token in memory (`Credential::Memory`) instead of a file; a request or facts collection that such a stop leaves running keeps the state locked until it ends (a request within two minutes, its timeout; a facts collection has none), and a push started meanwhile says it is still finishing.
+`semon push [--receiver URL] [--watch]` keeps a copy of these logs on another server that implements the [push protocol](docs/push-protocol.md). It sends only supported native source files (`semon_sessions::inputs`), redacted on this machine before they leave (known secret shapes become `*`, byte for byte). It also sends this machine's facts: hostname, live processes, held Codex locks and repositories (`semon_sessions::local_facts`). A copy built with `--facts FILE` (or `Options::facts`) preserves the source machine’s recorded identity and runtime observations. Set up the receiver and pair the origin before pushing. See [Receive pushes from your other machines](#receive-pushes-from-your-other-machines). The client's cursor state is kept under `$XDG_STATE_HOME/semon/push/`, 0600. One push at a time runs with a state file: it holds an OS lock on `<state>.lock` beside it, and a second push with the same state (by default, to the same receiver URL, however its scheme, host case or trailing slash is spelled) fails at once until the first ends. Ctrl-C or SIGTERM ends a push, `--watch` included, within a moment, from wherever it was, with the state file recording what the receiver acknowledged. An app that embeds the push calls `semon_push::push_until` with a `Stop`, and can pass the token in memory (`Credential::Memory`) instead of a file; a request or facts collection that such a stop leaves running keeps the state locked until it ends (a request within two minutes, its timeout; a facts collection has none), and a push started meanwhile says it is still finishing.
 
 Live Claude statuses observed so far are `busy`, `idle`, `shell` (a finished turn with background shells running, not counted as working) and `waiting` (stopped on a question or permission prompt, shown as needs you); any other status on a verified live process is shown verbatim. An unreadable transcript or rollout shows `unknown` state with whatever metadata is available. The default view contains roots active in the last 24 hours plus live roots. `--all` includes older sessions; `--since 2h` or `--since 3d` changes the window; `--session ID` selects one subtree. `--claude-home`, `--codex-home`, `--proc-root`, and `--cache` override every source and the cache for fixtures or alternate installations. The configured cache stem defaults to `$XDG_STATE_HOME/semon/sessions-index.json`, or `~/.local/state/semon/sessions-index.json`. Tree and focused reads share the Session Event Index at the same stem with extension `.sqlite3`; existing tree JSON files are left untouched. The origin-local index stores metadata, evidence locations and supported message/tool body text for ASI search and focused view. Body rows and FTS have the same custody as native logs; they never enter analytics or the Hub. Back up existing index/history data before an explicit reset.
 
@@ -108,14 +108,46 @@ same archive after every batch or restart; see the
 
 ## Receive pushes from your other machines
 
-`semon receive` is a receiver for `semon push`, for one person with several machines, and the [mirror protocol](docs/mirror-protocol.md)'s reference implementation (`semon_push::mirror::Receiver`). Each machine pushes with its own token, and its copy lands in `DIR/machines/NAME/`: `claude/` and `codex/` hold the input files at their paths under each home, and `facts.json` holds the machine's facts. A token decides the machine, so one machine's token can't write another's files.
+`semon receive` is a receiver for `semon push`, for one person with several machines, and the [push protocol](docs/push-protocol.md)'s reference implementation (`semon_push::mirror::Receiver`). Each machine pushes with its own token, and its copy lands in `DIR/machines/<machine-id>/`: `claude/` and `codex/` hold the input files at their paths under each home, and `facts.json` holds the machine's facts. A token decides the machine, so one machine's token can't write another's files.
 
 The receiver uses the enrollment registry and separate kind-scoped credentials.
 Legacy `DIR/tokens` and `receive token` commands are refused. Preserve those files
 and retained history; explicitly re-pair machines without importing or deleting
-old state. Choose a fresh receiver directory for enrollment so legacy custody stays intact. A machine name is 1 to 63 of `a-z`, `0-9` and `-`.
+old state. Choose a fresh receiver directory so legacy custody stays intact.
 
-Receiver-side pairing starts in a trusted local terminal:
+### Pair through an HTTPS reverse proxy
+
+On the receiver, issue a code and start the HTTP listener:
+
+```sh
+semon pair --dir ~/semon-machines
+semon receive --dir ~/semon-machines
+```
+
+Point the proxy at `http://127.0.0.1:8735`. On the machine that will send logs:
+
+```sh
+semon pair https://receiver.example CODE
+semon push
+```
+
+Use the code only with your trusted receiver URL. Treat the command argument as a
+secret while the code is live. Anyone holding a live code can claim a machine ID.
+The code expires in 10 minutes and each new code replaces the last. A wrong code
+burns the pending code and pauses issuance for one minute, including across restarts.
+Pairing saves the URL and Bearer in private `pair.json` under
+`$XDG_CONFIG_HOME/semon/origin/` (default `~/.config/semon/origin/`). Plain `semon push`
+uses that pairing and sends redacted logs from the supported inputs plus machine
+facts. Pairing prints the manual push command. To keep pushing, run `semon push --watch`
+yourself.
+
+On the receiver, `semon unpair --dir DIR MACHINE_ID` revokes the current pairing
+Bearer and keeps received logs. Pairing the same ID again replaces that Bearer.
+On the origin, `semon unpair` removes the local `pair.json`.
+
+### TLS-bound enrollment
+
+For the separate terminal-based enrollment flow, run on the receiver:
 
 ```sh
 semon receive enroll --machine laptop --dir ~/semon-mirror \
@@ -140,7 +172,7 @@ existing custody is preserved and never migrated or deleted.
 
 Enter the receiver's code in the non-echoing controlling-terminal prompt, then
 review the authenticated receiver identity, mirror-only scope and current source
-list and enter `yes` to approve. No code, bearer or private key belongs in argv,
+list and enter `yes` to approve. For this TLS-bound flow, no code, bearer or private key belongs in argv,
 environment variables or a piped input. `connect` requires public-CA TLS 1.3;
 there is no trust-on-first-use or skipped certificate verification. ts.net
 hostnames appear in public certificate-transparency logs.
@@ -148,7 +180,7 @@ hostnames appear in public certificate-transparency logs.
 Origin custody lives under `$XDG_CONFIG_HOME/semon/origin/` (default
 `~/.config/semon/origin/`), with mode-0700 directories and separate mode-0600 key,
 credential, signed configuration and source-consent files. `connect` prints its
-normalized HTTPS receiver URL; use `push --receiver URL` when more than one is enrolled.
+normalized HTTPS receiver URL. Use `push --receiver URL` to select TLS-bound enrollment explicitly, including when `pair.json` exists.
 Use `semon disconnect --receiver https://receiver.example:8735` on the origin to
 stop local use after typing literal `yes` at its controlling terminal. This keeps
 history, keys, source consent and audits; it sends no receiver request and does
@@ -159,9 +191,9 @@ Analytics/body enrollment, client certificates and issuer trust are not enabled.
 
 A running receiver checks current enrollment, kind and credential validity and
 revocation on each request, including kept-alive connections. Machine credentials
-never establish user identity or source authority. Revocation CLI arrives in PR4.
+never establish user identity or source authority.
 
-The receiver listens on `127.0.0.1:8735` unless `--listen ADDR` says otherwise. A non-loopback address is refused unless `--tls-cert PEM --tls-key PEM` are given; plain HTTP off loopback is always refused. These are the generic `semon receive` rules, implemented in `semon-push`. Semon never opens a port or obtains a certificate: the address, the firewall, DNS and the certificate stay your choices. `semon push` checks a certificate against the standard web roots only, so a TLS receiver needs a certificate that chains to them; configure a trusted certificate before using a remote receiver.
+The receiver listens on `127.0.0.1:8735` unless `--listen ADDR` says otherwise. Use `--tls-cert PEM --tls-key PEM` to terminate TLS at the receiver. If a proxy terminates TLS, keep the HTTP listener reachable only over the trusted backend link. Clients accept HTTPS with standard public CA and hostname checks, or plain HTTP to loopback. Configure the firewall, DNS and certificate for your setup.
 
 Its limits:
 
@@ -182,7 +214,7 @@ semon receive name machine-6754a9c1e83f27b4 --clear --dir ~/semon-machines
 ```
 
 Use the complete generated ID from the listing. Name changes are audited in the
-same registry transaction. Registry format 6 refuses older state explicitly;
+same registry transaction. Registry format 7 refuses older state explicitly;
 keep that directory unchanged and re-enroll into a new receiver directory.
 A received directory without a machine record is skipped with a re-enrollment warning; recorded machines remain available;
 Semon never deletes or moves retained logs.

@@ -1,5 +1,5 @@
-//! `semon receive`'s listener: the mirror protocol over HTTP/1.1, plain on
-//! loopback or TLS with an operator-supplied certificate and key. It serves
+//! `semon receive`'s HTTP/1.1 listener, with optional TLS using an
+//! operator-supplied certificate and key. It serves
 //! mirror routes to [`Receiver`], protected provisioning, and the closed reverse
 //! body poll/response routes when body custody is configured.
 //!
@@ -288,9 +288,6 @@ impl Server {
     /// existing one others can read is refused), and binds.
     pub fn bind(options: &ServeOptions) -> Result<Self, String> {
         let dir = &options.dir;
-        if !options.listen.ip().is_loopback() && options.tls.is_none() {
-            return Err("non-loopback receiver requires --tls-cert and --tls-key".into());
-        }
         prepare_private_dir(dir, true)?;
         let tokens = Authenticator::open(dir)?;
         let credential_count = tokens.count()?;
@@ -787,6 +784,7 @@ fn reason(status: u16) -> &'static str {
         413 => "Content Too Large",
         417 => "Expectation Failed",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         505 => "HTTP Version Not Supported",
         507 => "Insufficient Storage",
         _ => "Internal Server Error",
@@ -1218,8 +1216,51 @@ fn answer_provisioning(slot: &mut Slot, connection: &mut Connection, head: &Head
     }
 }
 
-/// Checks a request in order (endpoint, method, framing, token, size) and,
-/// only once all pass, reads its body and answers it.
+fn answer_pairing(shared: &Shared, connection: &mut Connection, head: &Head) -> Next {
+    use crate::push_pairing;
+    if head.method != "POST" {
+        return Next::Refuse(405, "pairing requires POST", &[("Allow", "POST")]);
+    }
+    let Some(length) = head.content_length else {
+        return Next::Refuse(411, "a Content-Length is required", &[]);
+    };
+    if length > push_pairing::CAP as u64 {
+        return Next::Refuse(413, "pairing body is over the 1 KiB limit", &[]);
+    }
+    if head.content_type.as_deref() != Some("application/json") {
+        return Next::Refuse(400, "pairing requires application/json", &[]);
+    }
+    let deadline = connection.stream.timed().deadline;
+    if head.expect_continue && connection.send(b"HTTP/1.1 100 Continue\r\n\r\n").is_err() {
+        return Next::Close;
+    }
+    let body = match connection.read_body_until(length as usize, deadline) {
+        Ok(body) => zeroize::Zeroizing::new(body),
+        Err(error) if is_timeout(&error) => {
+            return Next::Refuse(408, "the request took too long", &[]);
+        }
+        Err(_) => return Next::Close,
+    };
+    let Some(request) = push_pairing::Request::parse(&body) else {
+        return Next::Refuse(400, "invalid pairing body", &[]);
+    };
+    let Ok(now) = crate::origin_custody::now() else {
+        return Next::Refuse(500, "pairing clock is unavailable", &[]);
+    };
+    let token = match push_pairing::redeem(shared.receiver.dir(), request, now) {
+        Ok(Some(token)) => token,
+        Ok(None) => return Next::Refuse(401, "pairing refused", &[]),
+        Err(crate::enrollment::Error::InUse) => {
+            return Next::Refuse(503, "pairing temporarily unavailable", &[]);
+        }
+        Err(_) => return Next::Refuse(500, "pairing could not be committed", &[]),
+    };
+    match connection.respond(200, &push_pairing::response(&token), head.close, &[]) {
+        Ok(()) => Next::Continue,
+        Err(_) => Next::Close,
+    }
+}
+
 fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &Head) -> Next {
     if head.target.starts_with("/v1/provision/") || head.target.starts_with("/v1/renew/") {
         return answer_provisioning(slot, connection, head);
@@ -1234,11 +1275,8 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
     if head.expect_other {
         return Next::Refuse(417, "only Expect: 100-continue is understood", &[]);
     }
-    let Some((kind, endpoint)) = classify_route(&head.target) else {
-        return authority_refusal();
-    };
-    if kind != Kind::MirrorPush && shared.tls.is_none() {
-        return authority_refusal();
+    if head.target == crate::push_pairing::ROUTE {
+        return answer_pairing(shared, connection, head);
     }
     let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(now) => now.as_secs(),
@@ -1249,27 +1287,40 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
         .provisioning_clock
         .as_ref()
         .map_or(now, |clock| clock());
+    let Some((kind, endpoint)) = classify_route(&head.target) else {
+        return authority_refusal();
+    };
+    if kind != Kind::MirrorPush && shared.tls.is_none() {
+        return authority_refusal();
+    }
     if kind == Kind::BodyChannel {
         return body::answer_body(shared, slot, connection, head, now);
     }
-    let Some(authenticated) = shared.tokens.registry().authenticated_enrollment(
-        &mut connection.authority,
-        head.authorization.as_deref(),
-        kind,
-        now,
-    ) else {
-        return authority_refusal();
+    let paired = endpoint.and_then(|_| {
+        shared
+            .tokens
+            .registry()
+            .paired_machine(head.authorization.as_deref())
+    });
+    let machine = if let Some(machine) = &paired {
+        machine.clone()
+    } else {
+        let Some(authenticated) = shared.tokens.registry().authenticated_enrollment(
+            &mut connection.authority,
+            head.authorization.as_deref(),
+            kind,
+            now,
+        ) else {
+            return authority_refusal();
+        };
+        authenticated.machine
     };
     // Classified routes are closed until their owning slices install handlers.
     let Some(endpoint) = endpoint else {
         return authority_refusal();
     };
     if head.method != "POST" {
-        return Next::Refuse(
-            405,
-            "the mirror protocol is POST only",
-            &[("Allow", "POST")],
-        );
+        return Next::Refuse(405, "the push protocol is POST only", &[("Allow", "POST")]);
     }
     let Some(length) = head.content_length else {
         return Next::Refuse(411, "a Content-Length is required", &[]);
@@ -1288,7 +1339,15 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
         }
         Err(_) => return Next::Close,
     };
-    let machine = authenticated.machine;
+    if paired.is_some()
+        && shared
+            .tokens
+            .registry()
+            .paired_machine(head.authorization.as_deref())
+            != paired
+    {
+        return authority_refusal();
+    }
     let reply = shared.receiver.handle(&machine, endpoint, &body);
     if reply.status >= 500 {
         eprintln!("semon receive: {machine}: {}", reply.body);
@@ -1313,11 +1372,11 @@ mod tests {
     #[test]
     fn a_head_is_parsed_strictly() {
         let head = parse_head(
-            b"POST /v1/mirror/append HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+            b"POST /v1/push/append HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
         )
         .unwrap();
         assert_eq!(head.method, "POST");
-        assert_eq!(head.target, "/v1/mirror/append");
+        assert_eq!(head.target, "/v1/push/append");
         assert_eq!(head.content_length, Some(12));
         assert_eq!(head.authorization.as_deref(), Some("Bearer abc"));
         assert!(head.close);

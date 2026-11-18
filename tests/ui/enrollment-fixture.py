@@ -14,7 +14,8 @@ enrollment_dir.mkdir(mode=0o700)
 token = secrets.token_hex(32)
 enrollment_id = secrets.token_hex(32)
 registry = {
-    "format": 6,
+    "format": 7,
+    "push_pairing": {"pending": None, "pause_until": 0, "bearers": {}, "audit": []},
     "machines": [{"id": "machine-6754a9c1e83f27b4", "directory": "machine-6754a9c1e83f27b4", "owner_name": None}],
     "machine_audit": [],
     "latest": 0,
@@ -33,7 +34,7 @@ registry = {
         "binding": {"state": "inapplicable"},
         "client_certificate_pins": [],
         "credential_kinds": [{
-            "kind": "mirror_push", "client_cert_required": False,
+            "kind": "push", "client_cert_required": False,
             "generations": {"current": 1, "retiring": None},
             "available": True,
         }],
@@ -41,7 +42,7 @@ registry = {
     }],
     "credentials": [{
         "credential_id": secrets.token_hex(32), "enrollment_id": enrollment_id,
-        "kind": "mirror_push", "sha256": list(hashlib.sha256(token.encode()).digest()),
+        "kind": "push", "sha256": list(hashlib.sha256(token.encode()).digest()),
         "generation": 1, "valid_from": 0, "valid_until": 18446744073709551615,
         "revoked_at": None,
     }],
