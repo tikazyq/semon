@@ -124,17 +124,16 @@ fn read_chunk(
 ) -> rusqlite::Result<(Vec<SessionChange>, Position, Reconciliation)> {
     let limit = i64::from(budget.sessions.get());
     let inventory = !matches!(position.cursor, Cursor::Done);
-    let candidates: Vec<(i64, String, String)>;
-    let tail;
-    match &position.cursor {
+    let (candidates, tail) = match &position.cursor {
         Cursor::Inventory(after) => {
             let mut keys = inventory_keys(tx, after, limit + 1)?;
-            tail = keys.len() as i64 > limit;
+            let tail = keys.len() as i64 > limit;
             keys.truncate(limit as usize);
-            candidates = keys
+            let candidates = keys
                 .into_iter()
-                .map(|key| (0, key, "changed".into()))
+                .map(|key| (0, key, String::from("changed")))
                 .collect();
+            (candidates, tail)
         }
         Cursor::Replay(_) | Cursor::Done => {
             let after = match position.cursor {
@@ -154,15 +153,14 @@ fn read_chunk(
                 last = row.get(0)?;
                 latest.insert(row.get::<_, String>(1)?, (last, row.get(2)?));
             }
-            tail = last < head;
             let mut latest: Vec<_> = latest
                 .into_iter()
                 .map(|(key, (seq, kind))| (seq, key, kind))
                 .collect();
             latest.sort_unstable_by_key(|(seq, _, _)| *seq);
-            candidates = latest;
+            (latest, last < head)
         }
-    }
+    };
 
     let mut changes = Vec::new();
     let mut steps = 0;
@@ -463,9 +461,9 @@ impl CheckpointCodec {
         if incarnation != self.incarnation {
             return Ok(None);
         }
-        let tag: Vec<_> = tag
-            .as_bytes()
-            .chunks_exact(2)
+        let (pairs, _) = tag.as_bytes().as_chunks::<2>();
+        let tag: Vec<_> = pairs
+            .iter()
             .map(|pair| {
                 u8::from_str_radix(std::str::from_utf8(pair).expect("validated ASCII"), 16)
                     .expect("validated hex")
