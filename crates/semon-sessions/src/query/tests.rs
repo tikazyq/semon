@@ -1066,7 +1066,10 @@ fn local_query_retries_an_append_during_verification_from_fresh_sources() {
     crate::query_source::DURING_VERIFY.with(|hook| hook.borrow_mut().take());
     let answer = result.unwrap();
     assert!(runs.get() > 1);
-    assert_eq!(answer["sessions"][0]["last_activity"], at(2, 0));
+    assert_eq!(
+        answer["sessions"][0]["last_activity"],
+        json!(crate::events::parse_ms(&ts(2, 0)).unwrap())
+    );
 }
 
 #[test]
@@ -3551,8 +3554,8 @@ fn selected_query_refuses_changed_bytes_generations_and_revocation() {
             assert!(!error.message.contains("revoked"));
             assert!(!error.message.contains("Permission denied"));
         } else {
-            // Prompt parsing tolerates the provider read error, but its sticky
-            // failure makes finish() retain the pre-R5 generic refusal.
+            // Prompt parsing can skip a failed provider read. Its sticky error
+            // still refuses the page without exposing the provider's message.
             assert_eq!(
                 error.message, "native query source generation unavailable",
                 "fault={fault}"

@@ -467,9 +467,10 @@ impl Records<'_> {
         if after == *before {
             return Ok(());
         }
-        if crate::source_carrier::mismatch(before, &after)
-            == Some(crate::source_carrier::RevisionReason::SizeGrew)
-            && ledger.resumes(&after, file)
+        if matches!(
+            crate::source_carrier::mismatch(before, &after),
+            Some(crate::source_carrier::RevisionReason::SizeGrew)
+        ) && ledger.resumes(&after, file)
             && crate::source_carrier::recheck(path, file, &after).is_ok()
         {
             return Err(io::Error::new(io::ErrorKind::InvalidData, SourceChanged));
@@ -1164,12 +1165,10 @@ impl Records<'_> {
                 .cloned();
             let offset = start + bytes.len() as u64;
             let max = len - bytes.len();
-            let part = provider.read_range(
-                source,
-                expected.as_ref().map(|v| v.0.as_str()),
-                offset,
-                max,
-            )?;
+            // Provider messages can contain private paths or credentials.
+            let part = provider
+                .read_range(source, expected.as_ref().map(|v| v.0.as_str()), offset, max)
+                .map_err(|error| io::Error::new(error.kind(), unavailable()))?;
             if part.offset != offset
                 || part.bytes.is_empty()
                 || part.bytes.len() > max
