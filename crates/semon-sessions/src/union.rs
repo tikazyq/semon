@@ -1121,6 +1121,9 @@ impl ViewerCore {
                 etag: None,
             };
         }
+        if let Some(reply) = crate::viewer::static_reply(path) {
+            return reply;
+        }
         if path.starts_with("/session/") {
             return self.session_page(path, query);
         }

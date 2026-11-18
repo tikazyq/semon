@@ -373,6 +373,17 @@ fn receiver_serves_viewer_login_bearers_and_revocation_on_the_push_port() {
     assert_eq!(page.status, 200);
     assert_eq!(page.header("X-Frame-Options"), "DENY");
     assert_eq!(get("/", &bearer).status, 200);
+    for path in [
+        "/machines",
+        "/analytics",
+        "/viewer.js",
+        "/viewer.css",
+        "/shell.js",
+        "/shell.css",
+        "/favicon.svg",
+    ] {
+        assert_eq!(get(path, &cookie_header).status, 200, "{path}");
+    }
     assert_eq!(get(&format!("/?t={token}&%74={token}"), "").status, 403);
     let host = url.strip_prefix("http://").unwrap();
     assert_eq!(

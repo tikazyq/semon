@@ -1557,51 +1557,71 @@ impl MachineView {
         }
     }
     fn route(&self, path: &str, _query: &str) -> io::Result<(u16, &'static str, Vec<u8>)> {
-        let html = "text/html; charset=utf-8";
-        let json = "application/json; charset=utf-8";
-        match path {
-            "/" | "/analytics" | "/sessions" | "/machines" => Ok((200, html, PAGE.into())),
-            "/viewer.js" => Ok((
+        if path == "/api/tree" {
+            return Ok((
                 200,
-                "text/javascript; charset=utf-8",
-                crate::shell::VIEWER_JS.into(),
-            )),
-            "/viewer.css" => Ok((
-                200,
-                "text/css; charset=utf-8",
-                crate::shell::VIEWER_CSS.into(),
-            )),
-            "/mark.svg" => Ok((200, "image/svg+xml", include_str!("mark.svg").into())),
-            _ if crate::HARNESS_ICONS
-                .iter()
-                .any(|(icon_path, _)| *icon_path == path) =>
-            {
-                let svg = crate::HARNESS_ICONS
-                    .iter()
-                    .find_map(|(icon_path, svg)| (*icon_path == path).then_some(*svg))
-                    .expect("icon path was matched in HARNESS_ICONS");
-                Ok((200, "image/svg+xml", svg.as_bytes().to_vec()))
-            }
-            "/favicon.svg" => Ok((200, "image/svg+xml", include_str!("favicon.svg").into())),
-            "/shell.js" => Ok((
-                200,
-                "text/javascript; charset=utf-8",
-                crate::shell::JS.into(),
-            )),
-            "/shell.css" => Ok((200, "text/css; charset=utf-8", crate::shell::CSS.into())),
-            "/api/tree" => Ok((200, json, self.tree_json()?.into_bytes())),
-            _ if path.starts_with("/fonts/") => {
-                let name = path["/fonts/".len()..]
-                    .strip_suffix(".woff2")
-                    .ok_or(io::ErrorKind::NotFound)?;
-                FONTS
-                    .iter()
-                    .find(|(font, _)| *font == name)
-                    .map(|(_, bytes)| (200, "font/woff2", bytes.to_vec()))
-                    .ok_or_else(|| io::ErrorKind::NotFound.into())
-            }
-            _ => Err(io::ErrorKind::NotFound.into()),
+                "application/json; charset=utf-8",
+                self.tree_json()?.into_bytes(),
+            ));
         }
+        static_route(path)
+    }
+}
+
+/// Pages and assets do not depend on any machine being present yet.
+pub(crate) fn static_reply(path: &str) -> Option<ViewerReply> {
+    let (status, content_type, body) = static_route(path).ok()?;
+    Some(ViewerReply {
+        status,
+        content_type,
+        body,
+        etag: None,
+    })
+}
+
+fn static_route(path: &str) -> io::Result<(u16, &'static str, Vec<u8>)> {
+    let html = "text/html; charset=utf-8";
+    match path {
+        "/" | "/analytics" | "/sessions" | "/machines" => Ok((200, html, PAGE.into())),
+        "/viewer.js" => Ok((
+            200,
+            "text/javascript; charset=utf-8",
+            crate::shell::VIEWER_JS.into(),
+        )),
+        "/viewer.css" => Ok((
+            200,
+            "text/css; charset=utf-8",
+            crate::shell::VIEWER_CSS.into(),
+        )),
+        "/mark.svg" => Ok((200, "image/svg+xml", include_str!("mark.svg").into())),
+        _ if crate::HARNESS_ICONS
+            .iter()
+            .any(|(icon_path, _)| *icon_path == path) =>
+        {
+            let svg = crate::HARNESS_ICONS
+                .iter()
+                .find_map(|(icon_path, svg)| (*icon_path == path).then_some(*svg))
+                .expect("icon path was matched in HARNESS_ICONS");
+            Ok((200, "image/svg+xml", svg.as_bytes().to_vec()))
+        }
+        "/favicon.svg" => Ok((200, "image/svg+xml", include_str!("favicon.svg").into())),
+        "/shell.js" => Ok((
+            200,
+            "text/javascript; charset=utf-8",
+            crate::shell::JS.into(),
+        )),
+        "/shell.css" => Ok((200, "text/css; charset=utf-8", crate::shell::CSS.into())),
+        _ if path.starts_with("/fonts/") => {
+            let name = path["/fonts/".len()..]
+                .strip_suffix(".woff2")
+                .ok_or(io::ErrorKind::NotFound)?;
+            FONTS
+                .iter()
+                .find(|(font, _)| *font == name)
+                .map(|(_, bytes)| (200, "font/woff2", bytes.to_vec()))
+                .ok_or_else(|| io::ErrorKind::NotFound.into())
+        }
+        _ => Err(io::ErrorKind::NotFound.into()),
     }
 }
 

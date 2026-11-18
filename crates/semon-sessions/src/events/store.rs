@@ -4978,10 +4978,26 @@ fn init(connection: &mut Connection) -> rusqlite::Result<Init> {
         return Ok(found);
     }
     let fresh = matches!(found, Init::Fresh);
-    let mut initialized = false;
     if fresh {
-        // Cold initialization retains exclusion through the first WAL switch.
+        // Establish WAL before publishing a current schema. A process interrupted
+        // after schema commit must never leave current state in rollback mode.
+        // Exclusive locking persists across these transactions and the WAL switch.
         connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        let exclusive = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        match qualify_producer(&exclusive)? {
+            Init::Fresh | Init::Ready => {}
+            unsupported => return Ok(unsupported),
+        }
+        exclusive.commit()?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_FRESH_WAL.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        let mode: String =
+            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Ok(Init::NoWal);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match qualify_producer(&transaction)? {
             Init::Fresh => {
@@ -4993,21 +5009,13 @@ fn init(connection: &mut Connection) -> rusqlite::Result<Init> {
                     [CACHE_VERSION.to_string(), crate::storage::sqlite::stamp()],
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                initialized = true;
             }
             Init::Ready => {}
             unsupported => return Ok(unsupported),
         }
         transaction.commit()?;
     }
-    #[cfg(test)]
-    if initialized && let Some(hook) = BEFORE_FRESH_WAL.with(|slot| slot.borrow_mut().take()) {
-        hook();
-    }
-    let mut mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    if initialized && !mode.eq_ignore_ascii_case("wal") {
-        mode = connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-    }
+    let mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Ok(if fresh {
             Init::NoWal
@@ -11435,6 +11443,33 @@ mod tests {
                 .reconciliation,
             Reconciliation::ReplaceNamespace { .. }
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_first_wal_switch_leaves_no_current_schema() {
+        let root = scratch("interrupted-first-wal");
+        let path = root.join("index.sqlite3");
+        BEFORE_FRESH_WAL.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|| panic!("interrupt before WAL")));
+        });
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = opened(&path);
+            })
+            .is_err()
+        );
+        let db = Connection::open(&path).unwrap();
+        assert!(matches!(qualify_producer(&db).unwrap(), Init::Fresh));
+        drop(db);
+        let (store, _) = opened(&path);
+        let mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert!(current(&store.connection).unwrap());
+        drop(store);
         fs::remove_dir_all(root).unwrap();
     }
 
