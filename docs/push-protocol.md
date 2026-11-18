@@ -52,9 +52,10 @@ and audits `paired` with `replaced: bool`. It returns **200**:
 ```
 
 Tokens have no expiry or renewal. Only their SHA-256 hashes are stored on the
-receiver. Push requests use `Authorization: Bearer <token>`; the token selects
-exactly one machine directory. Unknown/revoked tokens receive **401**. Revocation
-is rechecked on every request, including kept-alive connections.
+receiver. Each push request uses its own `Authorization: Bearer <token>` to select
+exactly one machine directory. The receiver checks that token against the current
+registry on every request. An HTTPS proxy may reuse one origin connection for
+requests from different machines.
 
 ### `POST <url>/v1/unpair`
 
@@ -97,6 +98,16 @@ workspace and native harness state required for independent recovery.
 ## Requests
 
 Push requests are `POST` with a JSON body and `Authorization: Bearer <token>`. `<url>` is the base URL passed to `semon pair URL CODE`. It must be `https`, except plain `http` to a loopback address (`localhost`, `[::1]`, 127.0.0.0/8).
+
+For a well-formed HTTP request head, the receiver matches the exact push endpoint
+before checking the Bearer. Unknown push endpoints return **404**. Append, facts
+and status return **401** with `WWW-Authenticate: Bearer` for a missing, unknown
+or revoked token. The receiver checks authority and framing before reading a push
+body. Connection limits and body framing do not use machine identity.
+
+The receiver logs each HTTP refusal it issues for the protocol once on stderr,
+with a fixed endpoint label, status and reason class. It omits request URLs,
+tokens, pairing codes and bodies.
 
 Request bodies currently use identity encoding. Response gzip/Brotli and sealed
 storage are independent. See [native archive transport and codec measurements](native-archive-transport.md)

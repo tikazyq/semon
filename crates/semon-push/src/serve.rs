@@ -8,8 +8,9 @@
 //! [`Limits::connections_per_ip`]; one more over either is closed as soon
 //! as it is accepted. Once authenticated, it counts only in the total, so
 //! several machines behind one address (an SSH tunnel, a NAT) each keep
-//! their connection. A request's token is checked, and its
-//! declared length against [`MAX_BODY_BYTES`], before any of its body is
+//! their connection. Each push request's own token selects its machine, even
+//! on a reused connection. The token and declared length (against
+//! [`MAX_BODY_BYTES`]) are checked before any of its body is
 //! read. Every read and write of the socket, runs against a deadline (see [`Limits`]), so a client that trickles bytes
 //! can't hold a connection past it. Semon never opens a port in a firewall
 //! or obtains a certificate.
@@ -28,9 +29,9 @@ use serde_json::{Value, json};
 
 #[path = "serve_auth.rs"]
 mod auth;
-use auth::{Authenticator, ConnectionAuthority};
+use auth::Authenticator;
 
-use crate::receiver::{DEFAULT_MAX_BYTES, Endpoint, MAX_BODY_BYTES, Receiver};
+use crate::receiver::{DEFAULT_MAX_BYTES, Endpoint, MAX_BODY_BYTES, Receiver, Reply};
 
 /// Where `semon receive` listens unless told otherwise.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8735";
@@ -404,7 +405,6 @@ enum NoHead {
 struct Connection {
     stream: Timed,
     head_only: bool,
-    authority: ConnectionAuthority,
     /// Bytes read and not yet used.
     buffer: Vec<u8>,
     limits: Limits,
@@ -498,11 +498,15 @@ impl Connection {
 
     fn respond(
         &mut self,
+        endpoint: &'static str,
         status: u16,
         body: &Value,
         close: bool,
         headers: &[(&str, &str)],
     ) -> io::Result<()> {
+        if status >= 400 {
+            log_refusal(endpoint, status);
+        }
         let body = body.to_string();
         let mut out = format!(
             "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\n",
@@ -523,8 +527,14 @@ impl Connection {
     }
 
     /// Answers `status` and closes the connection.
-    fn refuse(mut self, status: u16, message: &str, headers: &[(&str, &str)]) {
-        let _ = self.respond(status, &json!({"error": message}), true, headers);
+    fn refuse(
+        mut self,
+        endpoint: &'static str,
+        status: u16,
+        message: &str,
+        headers: &[(&str, &str)],
+    ) {
+        let _ = self.respond(endpoint, status, &json!({"error": message}), true, headers);
         self.close();
     }
 
@@ -555,6 +565,27 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn log_refusal(endpoint: &'static str, status: u16) {
+    let class = match status {
+        400 => "invalid_request",
+        401 => "unauthorized",
+        403 => "pairing_refused",
+        404 => "unknown_endpoint",
+        405 => "method_not_allowed",
+        408 => "timeout",
+        409 => "conflict",
+        411 => "length_required",
+        413 => "body_too_large",
+        417 => "unsupported_expectation",
+        431 => "head_too_large",
+        503 => "unavailable",
+        505 => "unsupported_http_version",
+        507 => "storage_limit",
+        _ => "receiver_error",
+    };
+    eprintln!("semon receive: endpoint={endpoint} status={status} reason={class}");
 }
 
 fn reason(status: u16) -> &'static str {
@@ -703,7 +734,6 @@ fn serve_connection(slot: &mut Slot, socket: TcpStream, accepted: Instant) {
     let mut connection = Connection {
         stream: timed,
         head_only: false,
-        authority: ConnectionAuthority::default(),
         buffer: Vec::new(),
         limits,
     };
@@ -712,31 +742,57 @@ fn serve_connection(slot: &mut Slot, socket: TcpStream, accepted: Instant) {
         let head = match connection.read_head(first.take()) {
             Ok(head) => head,
             Err(NoHead::Refused(status, message)) => {
-                return connection.refuse(status, message, &[]);
+                return connection.refuse("unknown", status, message, &[]);
             }
             Err(NoHead::TimedOut { started: true }) => {
-                return connection.refuse(408, "the request took too long", &[]);
+                return connection.refuse("unknown", 408, "the request took too long", &[]);
             }
             Err(NoHead::TimedOut { started: false } | NoHead::Closed) => {
                 return connection.close();
             }
         };
-        if head.target != "/v1/pair"
-            && head.target != "/v1/unpair"
-            && !head.target.starts_with("/v1/push/")
+        let target = head.target.as_str();
+        let path = target.split_once('?').map_or(target, |(path, _)| path);
+        if target != "/v1/pair"
+            && target != "/v1/unpair"
+            && path != "/v1/push"
+            && !path.starts_with("/v1/push/")
             && let Some(viewer) = &shared.viewer
         {
             if !slot.admit_viewer() {
-                return connection.refuse(503, "request refused", &[]);
+                return connection.refuse("viewer", 503, "request refused", &[]);
             }
             return serve_viewer(viewer, connection, head);
         }
         connection.head_only = head.method == "HEAD";
-        match answer(shared, slot, &mut connection, &head) {
-            Next::Continue if !head.close => {}
-            Next::Continue | Next::Close => return connection.close(),
+        let (label, next) = match target {
+            "/v1/pair" => ("pair", answer_pair(shared, slot, &mut connection, &head)),
+            "/v1/unpair" => ("unpair", answer_pair(shared, slot, &mut connection, &head)),
+            _ => match Endpoint::from_path(target) {
+                Some(endpoint) => {
+                    let label = match endpoint {
+                        Endpoint::Append => "append",
+                        Endpoint::Facts => "facts",
+                        Endpoint::Status => "status",
+                    };
+                    (
+                        label,
+                        answer_push(shared, slot, &mut connection, &head, endpoint),
+                    )
+                }
+                None => ("unknown", Next::Refuse(404, "unknown endpoint", &[])),
+            },
+        };
+        match next {
+            Next::Reply(reply) => {
+                let sent = connection.respond(label, reply.status, &reply.body, head.close, &[]);
+                if head.close || sent.is_err() {
+                    return connection.close();
+                }
+            }
+            Next::Close => return connection.close(),
             Next::Refuse(status, message, headers) => {
-                return connection.refuse(status, message, headers);
+                return connection.refuse(label, status, message, headers);
             }
         }
     }
@@ -783,8 +839,8 @@ fn serve_viewer(viewer: &semon_sessions::Viewer, mut connection: Connection, hea
 }
 
 enum Next {
-    /// Answered: read the next request unless this one closes.
-    Continue,
+    /// Send the reply and read the next request unless this one closes.
+    Reply(Reply),
     /// The connection can't go on (its body was cut short, or the answer
     /// couldn't be written).
     Close,
@@ -833,18 +889,28 @@ fn answer_pair(shared: &Shared, slot: &mut Slot, connection: &mut Connection, he
         json!({"version": 1})
     };
     slot.authenticated();
-    match connection.respond(200, &reply, head.close, &[]) {
-        Ok(()) => Next::Continue,
-        Err(_) => Next::Close,
-    }
+    Next::Reply(Reply {
+        status: 200,
+        body: reply,
+    })
 }
 
-/// Checks a request in order (endpoint, method, framing, token, size) and,
-/// only once all pass, reads its body and answers it.
-fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &Head) -> Next {
-    if head.target == "/v1/pair" || head.target == "/v1/unpair" {
-        return answer_pair(shared, slot, connection, head);
-    }
+/// Authenticate the request for this endpoint, then check its method and
+/// framing before reading any body bytes.
+fn answer_push(
+    shared: &Shared,
+    slot: &mut Slot,
+    connection: &mut Connection,
+    head: &Head,
+    endpoint: Endpoint,
+) -> Next {
+    let Some(machine) = shared
+        .tokens
+        .registry()
+        .authenticate(head.authorization.as_deref())
+    else {
+        return authority_refusal();
+    };
     if head.transfer_encoding {
         return Next::Refuse(
             411,
@@ -855,16 +921,6 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
     if head.expect_other {
         return Next::Refuse(417, "only Expect: 100-continue is understood", &[]);
     }
-    let Some(endpoint) = Endpoint::from_path(&head.target) else {
-        return authority_refusal();
-    };
-    let Some(machine) = shared
-        .tokens
-        .registry()
-        .authenticate(&mut connection.authority, head.authorization.as_deref())
-    else {
-        return authority_refusal();
-    };
     if head.method != "POST" {
         return Next::Refuse(405, "the push protocol is POST only", &[("Allow", "POST")]);
     }
@@ -885,14 +941,7 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
         }
         Err(_) => return Next::Close,
     };
-    let reply = shared.receiver.handle(&machine, endpoint, &body);
-    if reply.status >= 500 {
-        eprintln!("semon receive: {machine}: {}", reply.body);
-    }
-    match connection.respond(reply.status, &reply.body, head.close, &[]) {
-        Ok(()) => Next::Continue,
-        Err(_) => Next::Close,
-    }
+    Next::Reply(shared.receiver.handle(&machine, endpoint, &body))
 }
 
 #[cfg(test)]

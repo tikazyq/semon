@@ -242,14 +242,9 @@ fn an_append_is_answered_over_http() {
 }
 
 #[test]
-fn unknown_and_revoked_tokens_are_401() {
+fn push_routes_require_current_tokens() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001", "machine-6754a9c100000002"]);
     let body = append_body(LOG, b"", 0, b"one\n");
-    for token in [None, Some("nope"), Some("")] {
-        let answer = post(receiving.address, APPEND, token, &body);
-        assert_eq!(answer.status, 401, "{token:?}");
-        assert!(answer.head.contains("WWW-Authenticate: Bearer"));
-    }
     // A token in another scheme is no token.
     let request = format!(
         "POST {APPEND} HTTP/1.1\r\nAuthorization: Basic {}\r\nContent-Length: 0\r\n\r\n",
@@ -263,23 +258,20 @@ fn unknown_and_revoked_tokens_are_401() {
 
     // Revoked while the receiver runs: refused from the next request on.
     semon_push::simple_pair::unpair(&receiving.dir, "machine-6754a9c100000001", 1).unwrap();
-    let more = append_body(LOG, b"one\n", 4, b"two\n");
-    assert_eq!(
-        post(receiving.address, APPEND, Some(&tokens[0]), &more).status,
-        401
-    );
+    for route in [APPEND, "/v1/push/facts", "/v1/push/status"] {
+        for (kind, token) in [
+            ("missing", None),
+            ("empty", Some("")),
+            ("unknown", Some("nope")),
+            ("revoked", Some(tokens[0].as_str())),
+        ] {
+            let answer = post(receiving.address, route, token, b"{}");
+            assert_eq!(answer.status, 401, "{route}: {kind} token");
+            assert!(answer.head.contains("WWW-Authenticate: Bearer"));
+        }
+    }
     let facts = json!({"version": 2, "hostname": "laptop", "home": null, "proc_starts": {}, "codex_locks": {}, "repos": {}, "repo_ids": {}});
     let facts = facts.to_string().into_bytes();
-    assert_eq!(
-        post(
-            receiving.address,
-            "/v1/push/facts",
-            Some(&tokens[0]),
-            &facts
-        )
-        .status,
-        401
-    );
     // The other machine's token still works.
     assert_eq!(
         post(
@@ -320,7 +312,7 @@ fn an_oversize_body_is_413_before_it_is_read() {
 }
 
 #[test]
-fn only_post_to_the_two_endpoints() {
+fn push_routes_require_exact_paths_and_post() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     let answer = exchange(
         receiving.address,
@@ -335,19 +327,20 @@ fn only_post_to_the_two_endpoints() {
     for route in [
         "/",
         "/v1/push",
+        "/v1/push/unknown",
         "/v1/push/append/",
         "/v1/push/append?x=1",
         "/v1/frames",
     ] {
-        assert_eq!(
-            post(receiving.address, route, Some(&tokens[0]), b"{}").status,
-            401,
-            "{route}"
-        );
+        for token in [None, Some("unknown"), Some(tokens[0].as_str())] {
+            let answer = post(receiving.address, route, token, b"{}");
+            assert_eq!(answer.status, 404, "{route}");
+            assert!(!answer.head.contains("WWW-Authenticate"));
+        }
         let get = format!("GET {route} HTTP/1.1\r\n\r\n");
         assert_eq!(
             exchange(receiving.address, get.as_bytes()).status,
-            401,
+            404,
             "{route}"
         );
     }
@@ -591,28 +584,59 @@ fn a_post_without_a_length_is_411() {
 }
 
 #[test]
-fn registry_keep_alive_cannot_switch_machines() {
-    let (receiving, tokens) = receiving(&["machine-6754a9c100000001", "machine-6754a9c100000003"]);
+fn a_kept_alive_connection_can_alternate_machines() {
+    let machines = ["machine-6754a9c100000001", "machine-6754a9c100000003"];
+    let (receiving, tokens) = receiving(&machines);
+    let copies = machines.map(|id| {
+        receiving
+            .dir
+            .join("machines")
+            .join(id)
+            .join("claude")
+            .join(LOG)
+    });
     let mut stream = TcpStream::connect(receiving.address).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
-    for (index, token) in tokens.iter().enumerate() {
-        let body = append_body(LOG, b"", 0, b"hello\n");
+    let mut expected = [Vec::new(), Vec::new()];
+    let appends: [(usize, &[u8]); 4] = [
+        (0, b"laptop\n"),
+        (1, b"desk\n"),
+        (0, b"laptop again\n"),
+        (1, b"desk again\n"),
+    ];
+    for (index, line) in appends {
+        let before = &mut expected[index];
+        let body = append_body(LOG, before, before.len() as u64, line);
         let head = format!(
-            "POST {APPEND} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+            "POST {APPEND} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+            tokens[index],
             body.len()
         );
         stream.write_all(head.as_bytes()).unwrap();
         stream.write_all(&body).unwrap();
         let answer = read_one(&mut stream);
-        assert_eq!(
-            answer.status,
-            if index == 0 { 200 } else { 401 },
-            "machine {index}: {}",
-            answer.body
-        );
+        before.extend_from_slice(line);
+        assert_eq!(answer.status, 200, "machine {index}: {}", answer.body);
+        assert_eq!(answer.body["length"], before.len());
+        for (path, bytes) in copies.iter().zip(&expected) {
+            if bytes.is_empty() {
+                assert_eq!(
+                    fs::read(path).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            } else {
+                assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+            }
+        }
     }
+
+    semon_push::simple_pair::unpair(&receiving.dir, machines[0], 1).unwrap();
+    stream
+        .write_all(&request(receiving.address, APPEND, Some(&tokens[0]), b"{}"))
+        .unwrap();
+    assert_eq!(read_one(&mut stream).status, 401);
 }
 
 /// Reads one answer off a kept-alive connection: its head, then
@@ -791,14 +815,12 @@ fn status_head_advertises_post_without_body_and_unknown_routes_stay_unsupported(
     assert!(answer.body.is_null());
     assert_eq!(answer.body_bytes, 0, "HEAD must not send an error body");
     let unknown = head.replace("/v1/push/status", "/v1/push/unknown-status");
-    assert_eq!(exchange(receiving.address, unknown.as_bytes()).status, 401);
-    let unauthorized = post(
-        receiving.address,
-        "/v1/push/status",
-        Some("revoked-token"),
-        b"{}",
-    );
-    assert_eq!(unauthorized.status, 401);
+    assert_eq!(exchange(receiving.address, unknown.as_bytes()).status, 404);
+    let unauthorized = "HEAD /v1/push/status HTTP/1.1\r\nConnection: close\r\n\r\n";
+    let answer = exchange(receiving.address, unauthorized.as_bytes());
+    assert_eq!(answer.status, 401);
+    assert!(answer.head.contains("WWW-Authenticate: Bearer"));
+    assert_eq!(answer.body_bytes, 0);
 }
 
 #[test]
