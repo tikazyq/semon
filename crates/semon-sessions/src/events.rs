@@ -3641,7 +3641,7 @@ pub(crate) fn scan_file(
                     .map_err(|error| io::Error::other(error.to_string()))?
                 && stored == ledger
             {
-                Arc::make_mut(&mut index).tree_summary = Some(metadata.summary);
+                index.tree_summary = Some(metadata.summary);
             }
         }
         cache.files.insert(

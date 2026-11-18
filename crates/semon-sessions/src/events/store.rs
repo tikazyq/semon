@@ -9853,6 +9853,7 @@ mod tests {
     fn full() -> FileIndex {
         FileIndex {
             dirty_rows: None,
+            body_batch: Default::default(),
             native_usage_observations: None,
             source_chunks: None,
             marker_index: Some(crate::native_marker::Index::default()),
