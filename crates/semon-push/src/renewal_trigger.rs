@@ -66,6 +66,11 @@ impl Trigger {
             return Ok(None);
         };
         let (base, endpoint) = authority.renewal_location()?;
+        // Loopback HTTP transport has no TLS exporter for enrolled renewal.
+        // TLS-bound enrollment renews only over its authenticated HTTPS endpoint.
+        if endpoint.starts_with("http://") {
+            return Ok(None);
+        }
         let authority = authority.clone();
         let stop = stop.clone();
         let (end, ended) = mpsc::channel();

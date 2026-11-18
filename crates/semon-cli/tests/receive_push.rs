@@ -575,7 +575,10 @@ fn push_watch_stops_on(name: &str, number: i32) {
     fixture.write(&log, claude("watched").as_bytes());
 
     let home = fixture.path("home");
-    fixture.install_origin(&url);
+    // Finish index initialization before testing signal shutdown. A first-use
+    // facts worker can still be switching the index to WAL after upload progress;
+    // killing it there would test interrupted initialization instead of the lock.
+    assert_ok(&fixture.push(&url), "initialize the watch fixture index");
     let mut watch = semon()
         .args(["push", "--watch"])
         .env("XDG_CONFIG_HOME", fixture.path("config"))
@@ -623,6 +626,10 @@ fn push_watch_stops_on(name: &str, number: i32) {
         let line = said
             .recv_timeout(Duration::from_secs(60))
             .expect("watch initial pass");
+        assert!(
+            !line.contains("panicked at"),
+            "watch worker panicked: {line}"
+        );
         if line.starts_with("semon push: ") && line.contains(" files, ") {
             break;
         }
@@ -646,6 +653,10 @@ fn push_watch_stops_on(name: &str, number: i32) {
     assert_eq!(status.signal(), Some(number), "{status:?}");
     let mut stopped = false;
     while let Ok(line) = said.recv_timeout(Duration::from_secs(5)) {
+        assert!(
+            !line.contains("panicked at"),
+            "watch worker panicked: {line}"
+        );
         stopped |= line == "semon push: stopped";
     }
     assert!(stopped, "the watch didn't stop through its stop");
@@ -657,15 +668,30 @@ fn push_watch_stops_on(name: &str, number: i32) {
 }
 
 #[test]
-fn receive_refuses_plain_http_off_loopback() {
-    let fixture = Fixture::new();
+fn receive_allows_plain_http_off_loopback_and_requires_complete_tls_options() {
+    let mut fixture = Fixture::new();
     let dir = fixture.dir();
-    let refused = fixture.receive(&["--listen", "0.0.0.0:0", "--dir", dir.to_str().unwrap()]);
-    assert!(!refused.status.success());
+    semon_push::push_pair::initialize(&dir).unwrap();
+    let mut child = semon()
+        .args(["receive", "--listen", "0.0.0.0:0", "--dir"])
+        .arg(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver_stderr = child.stderr.take().unwrap();
+    fixture.receiver = Some(child);
+    let (sent, received) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(receiver_stderr).lines() {
+            let Ok(line) = line else { break };
+            let _ = sent.send(line);
+        }
+    });
+    let listening = received.recv_timeout(Duration::from_secs(60)).unwrap();
     assert!(
-        stderr(&refused).contains("--tls-cert"),
-        "{}",
-        stderr(&refused)
+        listening.starts_with("semon receive: listening on http://0.0.0.0:"),
+        "{listening}"
     );
     let refused = fixture.receive(&[
         "--listen",
