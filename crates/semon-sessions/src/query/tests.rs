@@ -44,16 +44,37 @@ fn local_query_retries_one_complete_cohort_after_verify_or_read_append() {
                 "claude/projects/-work-proj/race.jsonl",
                 &[
                     human("race", ts(1, 0), "original prompt"),
-                    assistant("race", ts(1, 1), vec![text("original answer")]),
+                    assistant(
+                        "race",
+                        ts(1, 1),
+                        vec![tool(
+                            "question",
+                            "AskUserQuestion",
+                            json!({"questions": [{"question": "Which option?", "header": "Option", "multiSelect": false,
+                                "options": [{"label": "first"}, {"label": "second"}]}]}),
+                        )],
+                    ),
                 ],
             );
             let mutations = Rc::new(Cell::new(0));
             let seen = mutations.clone();
+            let mut last_build = None;
             let hook: Box<dyn FnMut()> = Box::new(move || {
-                if seen.get() < failures {
+                let build = crate::model::BUILDS.with(Cell::get);
+                if seen.get() < failures && last_build != Some(build) {
+                    last_build = Some(build);
                     let n = seen.get() + 1;
                     seen.set(n);
-                    let record = human("race", ts(2, n), &format!("appended prompt {n}"));
+                    let record = assistant(
+                        "race",
+                        ts(2, n),
+                        vec![tool(
+                            &format!("question-{n}"),
+                            "AskUserQuestion",
+                            json!({"questions": [{"question": format!("Appended question {n}?"), "header": "Option", "multiSelect": false,
+                                "options": [{"label": "first"}, {"label": "second"}]}]}),
+                        )],
+                    );
                     writeln!(
                         fs::OpenOptions::new().append(true).open(&path).unwrap(),
                         "{record}"
@@ -67,10 +88,16 @@ fn local_query_retries_one_complete_cohort_after_verify_or_read_append() {
                 crate::query_source::AFTER_READ.with(|slot| *slot.borrow_mut() = Some(hook));
             }
             let mut query = home.query();
+            let builds = crate::model::BUILDS.with(Cell::get);
             let result = query.call_at("list_sessions", &json!({}), NOW);
             crate::query_source::AFTER_VERIFY.with(|slot| *slot.borrow_mut() = None);
             crate::query_source::AFTER_READ.with(|slot| *slot.borrow_mut() = None);
             assert_eq!(mutations.get(), failures);
+            assert_eq!(
+                crate::model::BUILDS.with(Cell::get) - builds,
+                2,
+                "exactly two complete preparations must run: verify={verify}, failures={failures}"
+            );
             if failures == 1 {
                 let answer = result.unwrap();
                 let fresh = home
@@ -115,7 +142,7 @@ fn local_query_does_not_retry_a_rewritten_consumed_prefix() {
             .unwrap();
         }))
     });
-    let result = home.query().call_at("stalls", &json!({}), NOW);
+    let result = home.query().call_at("list_sessions", &json!({}), NOW);
     crate::query_source::AFTER_VERIFY.with(|slot| *slot.borrow_mut() = None);
     let error = result.unwrap_err();
     assert_eq!(error.code, "io");
@@ -3541,8 +3568,8 @@ fn selected_query_refuses_changed_bytes_generations_and_revocation() {
             assert!(!error.message.contains("revoked"));
             assert!(!error.message.contains("Permission denied"));
         } else {
-            // Prompt parsing tolerates the provider read error, but its sticky
-            // failure makes finish() retain the pre-R5 generic refusal.
+            // Prompt parsing tolerates the provider read error. Completion
+            // retains its sanitized refusal, never the private provider cause.
             assert_eq!(
                 error.message, "native query source generation unavailable",
                 "fault={fault}"

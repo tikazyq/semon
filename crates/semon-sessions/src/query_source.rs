@@ -1225,12 +1225,12 @@ impl Records<'_> {
                 .cloned();
             let offset = start + bytes.len() as u64;
             let max = len - bytes.len();
-            let part = provider.read_range(
-                source,
-                expected.as_ref().map(|v| v.0.as_str()),
-                offset,
-                max,
-            )?;
+            let part = provider
+                .read_range(source, expected.as_ref().map(|v| v.0.as_str()), offset, max)
+                // Provider errors can contain credentials or private locations.
+                // Sanitize at the boundary before retaining the first failure;
+                // a provider must not trigger a fresh local query either.
+                .map_err(|_| unavailable())?;
             if part.offset != offset
                 || part.bytes.is_empty()
                 || part.bytes.len() > max
