@@ -1,10 +1,10 @@
-# The mirror protocol
+# The push protocol
 
 `semon push` keeps a copy of this machine's session logs on another server, a *receiver*, and sends it the machine's facts, so `semon-sessions` can discover, index and query those native sources using the recorded facts (`Options::facts`). This document is the whole contract: any server that implements it can receive a push.
 
 `semon receive` is the reference receiver (`semon_push::mirror::Receiver`, see the README's "Receive pushes from your other machines"). It keeps each machine's copy under `DIR/machines/<machine-id>/`, and caps a request body at 6 MiB: one append's 4 MiB of file bytes as base64, plus the JSON around it. Beyond the answers below, it may answer 411 (no `Content-Length`) and 507 (the machine's copy would pass its size cap); a client treats either as a failure.
 
-Registry format 6 stores the origin-generated canonical machine ID
+Registry format 7 stores the origin-generated canonical machine ID
 (`machine-<8 lowercase hex Unix seconds><8 secure random hex digits>`), its
 identical directory locator and optional owner display name. `connect` commits
 the origin ID into the authenticated pairing input. The receiver creates
@@ -17,7 +17,7 @@ Old state requires a fresh receiver directory and re-enrollment; retained logs
 are never migrated, moved or deleted.
 
 The reference receiver requires the current enrollment registry and a separate
-`mirror_push` bearer credential scoped to one machine. `connect` installs the
+`push` bearer credential scoped to one machine. `connect` installs the
 Push client's protected input for that kind bearer; a bearer is machine transport
 authority, never user identity or source authority. Legacy `DIR/tokens` state and
 `receive token` commands are refused; preserve old tokens/history and explicitly
@@ -33,6 +33,42 @@ The generic mirror protocol is independent of the retired Encrypted Relay.
 Mirrored content is readable by the receiver; sender redaction and HTTPS do not
 provide end-to-end encryption. A source mirror does not contain the complete
 workspace and native harness state required for independent recovery.
+
+## Simple pairing
+
+The receiver may listen on plain HTTP behind a public-CA HTTPS reverse proxy.
+Clients permit only public-CA HTTPS or loopback HTTP, never redirects or skipped
+certificate verification. Local `semon pair --dir DIR` initializes a new private
+receiver registry when needed and issues a 16-character random hex code (64 bits),
+valid for 600 seconds. Issuing a code replaces any pending code. Only SHA-256 code
+hashes are persisted. Pairing does not require the TLS exporter used by `connect`.
+
+`POST <url>/v1/pair` takes exactly `{"code":"…","machine":"machine-…"}`.
+Both fields are required; unknown/duplicate fields, malformed JSON, invalid machine
+IDs and bodies over 4096 bytes are refused. Content-Length is required and chunked
+bodies are refused. It returns 200 with exactly `{"machine":"machine-…","bearer":"…"}`.
+Invalid requests get 400, oversize bodies 413, and expired/consumed/wrong codes or
+paused pairing get 401. The client caps and strictly decodes responses too.
+
+A structurally valid redemption consumes the pending code even on a mismatch.
+Failure commits a code burn, cumulative failure count and a 30-second pause;
+from the third failure onward the pause is 300 seconds. Issuance cannot bypass a
+pause. Code state, pauses, hashed Bearers and pairing/revocation audit live in the
+same format-7 registry transaction and survive restart. Successful redemption
+issues a random 256-bit push Bearer, with no automatic expiry, replacing previous
+push authority for the same canonical machine ID. The registry stores its SHA-256
+hash only. Every push request checks current state; revocation invalidates tokens
+on existing connections too. `unpair --dir DIR MACHINE_ID` revokes push authority
+without deleting machine metadata or received logs.
+
+`semon pair URL CODE` stores the result by atomic rename as mode-0600
+`$XDG_CONFIG_HOME/semon/pair.json` (fallback `~/.config/semon/pair.json`). It supplies
+`push` URL and Bearer defaults. Machine-side `semon unpair` removes that local file
+only. Pairing prints the manual push command; no service or background push starts.
+Running push selects supported local source homes and applies normal redaction.
+TLS-bound enrollment, connect, disconnect and renewal retain their separate custody.
+There are no `/v1/mirror/*` aliases: push routes are `/v1/push/append`,
+`/v1/push/facts`, `/v1/push/status`; the credential wire kind is `push`.
 
 ## What is sent
 
@@ -52,7 +88,7 @@ Request bodies currently use identity encoding. Response gzip/Brotli and sealed
 storage are independent. See [native archive transport and codec measurements](native-archive-transport.md)
 for the bounded archive reader, coexistence/restart rules and upload experiment.
 
-### `POST <url>/v1/mirror/append`
+### `POST <url>/v1/push/append`
 
 ```json
 {"root": "claude", "path": "projects/-work/abc.jsonl", "redactor_version": 1, "offset": 0, "head_sha256": "…", "bytes": "…", "replace": false}
@@ -72,7 +108,7 @@ Answers:
 - **409** `{"length": N, "head_sha256": "…"}`: not applied, because `offset` isn't the copy's length or the head doesn't match. `N` is the copy's current length, and `head_sha256` is the hash of its first `min(4096, N)` bytes.
 - **400**: the body or the path is invalid. **401**: the token is unknown or revoked. **413**: the body is too large.
 
-### `POST <url>/v1/mirror/facts`
+### `POST <url>/v1/push/facts`
 
 The body is a `Facts` object:
 
@@ -104,7 +140,7 @@ A receiver may seal an idle copy to save space (`semon_sessions::sealed`). Its b
 
 ## Optional partial sync observations (status v1)
 
-`POST <url>/v1/mirror/status` is an optional extension, authenticated, admitted, size limited and scoped to the same machine as append and facts. Before posting status, a sender performs a cancellable bearer-authenticated HEAD capability request to that exact path, without following redirects, and requires 405 with `Allow: POST`. A cookie-gated 401/403 fallback, unknown route or other non-advertisement disables only this optional extension; append and full-facts refusals remain fatal. Once advertised, status POST token refusal is fatal, including subsequent revocation. A sender still disables status after POST 404 or 405, because an old generic HEAD handler can advertise POST globally. Successful status never lifts an append pause, storage restriction or retry delay. It does not replace `/facts`, delete retained copies, establish a complete collector selection or imply that an agent is executing.
+`POST <url>/v1/push/status` is an optional extension, authenticated, admitted, size limited and scoped to the same machine as append and facts. Before posting status, a sender performs a cancellable bearer-authenticated HEAD capability request to that exact path, without following redirects, and requires 405 with `Allow: POST`. A cookie-gated 401/403 fallback, unknown route or other non-advertisement disables only this optional extension; append and full-facts refusals remain fatal. Once advertised, status POST token refusal is fatal, including subsequent revocation. A sender still disables status after POST 404 or 405, because an old generic HEAD handler can advertise POST globally. Successful status never lifts an append pause, storage restriction or retry delay. It does not replace `/facts`, delete retained copies, establish a complete collector selection or imply that an agent is executing.
 
 ```json
 {"version":1,"observation_id":"0123456789abcdef0123456789abcdef","sequence":1,"observed_at_ms":1791539000000,"phase":"syncing","runtime":{"version":2,"hostname":"laptop","home":"/home/me","proc_starts":{},"codex_locks":{},"repos":{},"repo_ids":{}},"inventory_complete":true,"targets":[{"root":"codex","path":"sessions/native.jsonl","generation":"abcdef0123456789abcdef0123456789","target_bytes":12000,"acked_bytes":4096,"head_sha256":"…"}]}

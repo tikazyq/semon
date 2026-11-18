@@ -711,7 +711,7 @@ fn kind_label(kind: Kind) -> &'static [u8] {
     match kind {
         Kind::AnalyticsPublish => b"analytics_publish",
         Kind::BodyChannel => b"body_channel",
-        Kind::MirrorPush => b"mirror_push",
+        Kind::MirrorPush => b"push",
     }
 }
 fn bearer_secret(application: &[u8], id: &str, kind: Kind) -> Secret {
@@ -866,6 +866,11 @@ impl Core {
                         return Err(Error::Terminal);
                     }
                     fresh.endpoint = Some(enrollment.endpoint.clone());
+                    for bearer in &mut fresh.push_pair.bearers {
+                        if bearer.machine == enrollment.machine && bearer.revoked_at.is_none() {
+                            bearer.revoked_at = Some(now);
+                        }
+                    }
                     let predecessor = fresh
                         .enrollments
                         .iter()

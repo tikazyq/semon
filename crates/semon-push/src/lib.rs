@@ -1,4 +1,4 @@
-//! `semon push`: a client of the mirror protocol (docs/mirror-protocol.md).
+//! `semon push`: a client of the mirror protocol (docs/push-protocol.md).
 //! It keeps a receiver's copy of this machine's session logs in step with
 //! the originals, appending as they grow, and sends the machine's facts.
 //!
@@ -78,11 +78,15 @@ pub mod origin_custody;
 #[cfg(unix)]
 pub mod origin_read;
 #[cfg(unix)]
+pub mod pair_config;
+#[cfg(unix)]
 pub mod pairing;
 #[cfg(unix)]
 pub mod provision;
 #[cfg(unix)]
 pub mod provision_wire;
+#[cfg(unix)]
+pub mod push_pair;
 #[cfg(unix)]
 pub mod receiver_acl;
 #[cfg(unix)]
@@ -132,7 +136,7 @@ pub type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Debug)]
 pub struct PushOptions {
-    /// The receiver's base URL; requests go to `<url>/v1/mirror/…`.
+    /// The receiver's base URL; requests go to `<url>/v1/push/…`.
     pub url: String,
     pub credential: Credential,
     pub sessions: Options,
@@ -629,7 +633,7 @@ impl Client {
         let mut retries = 0;
         loop {
             let factory = Arc::clone(&self.http);
-            let request_url = format!("{}/v1/mirror/{route}", self.url);
+            let request_url = format!("{}/v1/push/{route}", self.url);
             let body = body.clone();
             let lock = self.lock.clone();
             let dispatch_stop = self.stop.clone();
@@ -2182,7 +2186,7 @@ mod tests {
             for mut request in worker.incoming_requests() {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
-                let response = if request.url() == "/v1/mirror/append" {
+                let response = if request.url() == "/v1/push/append" {
                     match serde_json::from_str::<Append>(&body) {
                         Ok(append) => {
                             let length = append.offset
@@ -2237,7 +2241,7 @@ mod tests {
         );
         thread::spawn(move || {
             for mut request in worker.incoming_requests() {
-                assert_eq!(request.url(), "/v1/mirror/append");
+                assert_eq!(request.url(), "/v1/push/append");
                 let mut body = Vec::new();
                 request.as_reader().read_to_end(&mut body).unwrap();
                 let mut append: Append = serde_json::from_slice(&body).unwrap();
@@ -2510,7 +2514,7 @@ mod tests {
                 let mut cold_after_fresh = 0;
                 for mut request in listener.incoming_requests() {
                     if request.method() == &tiny_http::Method::Head {
-                        assert_eq!(request.url(), "/v1/mirror/status");
+                        assert_eq!(request.url(), "/v1/push/status");
                         request
                             .respond(
                                 Response::empty(405)
@@ -2522,7 +2526,7 @@ mod tests {
                     let mut body = Vec::new();
                     request.as_reader().read_to_end(&mut body).unwrap();
                     match request.url() {
-                        "/v1/mirror/append" => {
+                        "/v1/push/append" => {
                             let append: Append = serde_json::from_slice(&body).unwrap();
                             if append.path == "projects/-work/pending.jsonl"
                                 && history_acks == 0
@@ -2553,7 +2557,7 @@ mod tests {
                                 .respond(Response::from_string(answer.body.to_string()))
                                 .unwrap();
                         }
-                        "/v1/mirror/status" => {
+                        "/v1/push/status" => {
                             let observation: wire::Status = serde_json::from_slice(&body).unwrap();
                             let answer = sink.handle("fixture", mirror::Endpoint::Status, &body);
                             assert_eq!(answer.status, 200);
@@ -2745,7 +2749,7 @@ mod tests {
                     .unwrap()
                     .expect("initial append or optional status");
                 if request.method() == &tiny_http::Method::Head {
-                    assert_eq!(request.url(), "/v1/mirror/status");
+                    assert_eq!(request.url(), "/v1/push/status");
                     request
                         .respond(
                             Response::empty(405)
@@ -2755,13 +2759,13 @@ mod tests {
                     continue;
                 }
                 match request.url() {
-                    "/v1/mirror/append" => {
+                    "/v1/push/append" => {
                         request
                             .respond(Response::from_string(body).with_status_code(status))
                             .unwrap();
                         break;
                     }
-                    "/v1/mirror/status" => {
+                    "/v1/push/status" => {
                         let mut input = String::new();
                         request.as_reader().read_to_string(&mut input).unwrap();
                         let observation: wire::Status = serde_json::from_str(&input).unwrap();
@@ -2782,7 +2786,7 @@ mod tests {
                     .unwrap()
                     .expect("restricted-pass status heartbeat");
                 if request.method() == &tiny_http::Method::Head {
-                    assert_eq!(request.url(), "/v1/mirror/status");
+                    assert_eq!(request.url(), "/v1/push/status");
                     request
                         .respond(
                             Response::empty(405)
@@ -2793,7 +2797,7 @@ mod tests {
                 }
                 assert_eq!(
                     request.url(),
-                    "/v1/mirror/status",
+                    "/v1/push/status",
                     "no append retry or premature full facts while restricted"
                 );
                 let mut input = String::new();
@@ -2970,7 +2974,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap()
                 .expect("legacy generation negotiation");
-            assert_eq!(request.url(), "/v1/mirror/append");
+            assert_eq!(request.url(), "/v1/push/append");
             let mut input = String::new();
             request.as_reader().read_to_string(&mut input).unwrap();
             let append: Append = serde_json::from_str(&input).unwrap();
@@ -3079,7 +3083,7 @@ mod sync_status_tests {
 
     fn answer_status_head(request: tiny_http::Request) -> Option<tiny_http::Request> {
         if request.method() == &tiny_http::Method::Head {
-            assert_eq!(request.url(), "/v1/mirror/status");
+            assert_eq!(request.url(), "/v1/push/status");
             request
                 .respond(
                     Response::empty(405)

@@ -288,9 +288,6 @@ impl Server {
     /// existing one others can read is refused), and binds.
     pub fn bind(options: &ServeOptions) -> Result<Self, String> {
         let dir = &options.dir;
-        if !options.listen.ip().is_loopback() && options.tls.is_none() {
-            return Err("non-loopback receiver requires --tls-cert and --tls-key".into());
-        }
         prepare_private_dir(dir, true)?;
         let tokens = Authenticator::open(dir)?;
         let credential_count = tokens.count()?;
@@ -1218,9 +1215,54 @@ fn answer_provisioning(slot: &mut Slot, connection: &mut Connection, head: &Head
     }
 }
 
+fn answer_pair(shared: &Shared, connection: &mut Connection, head: &Head) -> Next {
+    if head.method != "POST" {
+        return Next::Refuse(405, "pairing requires POST", &[("Allow", "POST")]);
+    }
+    if head.transfer_encoding {
+        return Next::Refuse(411, "a Content-Length is required", &[]);
+    }
+    if head.expect_other {
+        return Next::Refuse(417, "unsupported Expect", &[]);
+    }
+    let Some(length) = head.content_length else {
+        return Next::Refuse(411, "a Content-Length is required", &[]);
+    };
+    if length > crate::push_pair::MAX_BODY as u64 {
+        return Next::Refuse(413, "pairing body too large", &[]);
+    }
+    if head.expect_continue && connection.send(b"HTTP/1.1 100 Continue\r\n\r\n").is_err() {
+        return Next::Close;
+    }
+    let bytes = match connection.read_body(length as usize) {
+        Ok(bytes) => bytes,
+        Err(_) => return Next::Close,
+    };
+    let Ok(now) = crate::push_pair::now() else {
+        return authority_refusal();
+    };
+    let (status, body) = match shared.tokens.registry().pair(&bytes, now) {
+        Ok(reply) => (
+            200,
+            serde_json::to_value(reply).expect("pair response serializes"),
+        ),
+        Err(crate::enrollment::Error::Invalid) => {
+            (400, json!({"error": "invalid pairing request"}))
+        }
+        Err(_) => (401, json!({"error": "pairing refused"})),
+    };
+    match connection.respond(status, &body, head.close, &[]) {
+        Ok(()) => Next::Continue,
+        Err(_) => Next::Close,
+    }
+}
+
 /// Checks a request in order (endpoint, method, framing, token, size) and,
 /// only once all pass, reads its body and answers it.
 fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &Head) -> Next {
+    if head.target == "/v1/pair" {
+        return answer_pair(shared, connection, head);
+    }
     if head.target.starts_with("/v1/provision/") || head.target.starts_with("/v1/renew/") {
         return answer_provisioning(slot, connection, head);
     }
@@ -1313,11 +1355,11 @@ mod tests {
     #[test]
     fn a_head_is_parsed_strictly() {
         let head = parse_head(
-            b"POST /v1/mirror/append HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+            b"POST /v1/push/append HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
         )
         .unwrap();
         assert_eq!(head.method, "POST");
-        assert_eq!(head.target, "/v1/mirror/append");
+        assert_eq!(head.target, "/v1/push/append");
         assert_eq!(head.content_length, Some(12));
         assert_eq!(head.authorization.as_deref(), Some("Bearer abc"));
         assert!(head.close);

@@ -8,7 +8,7 @@ cleanup is authorized by this contract.
 ## Architecture
 
 Origins send selected, redacted native logs using the existing `semon push` →
-`semon receive` [mirror contract](../mirror-protocol.md). The receiver indexes
+`semon receive` [mirror contract](../push-protocol.md). The receiver indexes
 those logs, materializes ASI, runs analytics/SQL/search and serves transcripts
 locally. It is the durable custodian of the selected redacted session text.
 Origin availability is required for new uploads, not for reading retained copies.
@@ -93,8 +93,17 @@ separate push command, and separate Viewer command. See [README setup](../../REA
 and [`connect_terminal.rs`](../../crates/semon-cli/src/connect_terminal.rs).
 Do not advertise the four-action target as delivered. [C4, M]
 
-Use shipped public-CA TLS pairing and automatic idempotent renewal under enrolled
-trust. The owner deferred private-root/LAN pairing on **2026-11-14**, and #680
+Simple push pairing supports HTTPS reverse proxies with a plain HTTP receiver:
+`pair --dir DIR` issues a one-time code, `pair URL CODE` installs `pair.json`, and
+manual `push` uses its defaults. Long-lived push Bearers are revocable; receiver
+`unpair` preserves logs, while machine `unpair` forgets local custody only.
+The [push protocol](../push-protocol.md#simple-pairing) defines format-7 code burns,
+persisted pauses, atomic private config and canonical machine scopes. This adds
+no background service or automatic push. The TLS-bound `connect` flow and its
+explicit source consent remain available separately.
+
+Use public-CA HTTPS for remote clients; loopback HTTP is also permitted. TLS-bound
+pairing retains automatic idempotent renewal under enrolled trust. The owner deferred private-root/LAN pairing on **2026-11-14**, and #680
 removed the rejected 71-character pinned invitation. Do not restore it or invent
 a private-root profile. Loss/compromise still requires explicit trust recovery;
 normal renewal neither widens consent nor revives revoked authority. [C5, M]
@@ -138,7 +147,7 @@ multi-user or third-party receiver can revisit it without dormant runtime. [C2, 
   regardless of mode, without following a final symlink.
 - `connect` includes this ID in the committed pairing input, authenticated by the
   existing transcript and proof. The origin stores no additional identity state.
-- Registry format 6 records `{id, directory, owner_name}`; `directory` equals the ID.
+- Registry format 7 records `{id, directory, owner_name}`; `directory` equals the ID.
   Receiver storage is `machines/<machine-id>/`. Old state is refused: keep retained
   logs unchanged and re-enroll in a fresh receiver directory. No migration or deletion.
 - `receive enroll --machine NAME` supplies the starting owner display name only.
@@ -170,5 +179,5 @@ All new mechanisms above use these sources; no historical document overrides the
 | C4 | Owner, **2026-11-14**: UX/DX primary; four setup actions, combined narrowing/approval, automatic push, two processes; service install separately counted. |
 | C6 | Owner, **2026-11-15**: decisions A–D above (proven-duplicate accounting, generated canonical machine ID with hostname/optional-name grouping (amended: no linking), receiver-wide refusal cap, loopback-owner readers only). |
 | C5 | Owner, **2026-11-14**: private-root/LAN pairing deferred, pinned invitation removed (#680), no zero-findings scan gate for own-machine reads. |
-| M | Shipped [mirror](../mirror-protocol.md), [enrollment and renewal](asi-enrollment.md): source allowlist/redaction, export consent, transport authentication, credential custody and current trust lifecycle. |
+| M | Shipped [mirror](../push-protocol.md), [enrollment and renewal](asi-enrollment.md): source allowlist/redaction, export consent, transport authentication, credential custody and current trust lifecycle. |
 | I | [Repository invariants](../../AGENTS.md): native identity/lineage/provenance, source integrity and custody, body-free analytics/Hub, parser behavior, one current format, preserved frozen/user data and Viewer ownership/security. |

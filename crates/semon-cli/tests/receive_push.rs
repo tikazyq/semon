@@ -20,6 +20,92 @@ use std::{
 
 use serde_json::json;
 
+#[test]
+fn cli_pair_push_defaults_and_both_unpair_forms() {
+    let mut f = Fixture::new();
+    let issue = semon()
+        .args(["pair", "--dir"])
+        .arg(f.dir())
+        .env("SEMON_PRICING_REFRESH", "off")
+        .output()
+        .unwrap();
+    assert_ok(&issue, "issue one-time pairing code");
+    let text = String::from_utf8(issue.stdout).unwrap();
+    let code = text
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let url = f.start_receiver();
+    let paired = semon()
+        .args(["pair", &url, code])
+        .env("XDG_CONFIG_HOME", f.path("config"))
+        .env("HOME", f.path("home"))
+        .env("SEMON_PRICING_REFRESH", "off")
+        .output()
+        .unwrap();
+    assert_ok(&paired, "redeem code with real CLI");
+    let path = f.path("config/semon/pair.json");
+    let config = semon_push::pair_config::Config::load(&path)
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&paired.stdout).contains("semon push"));
+    f.write(
+        "home/claude/projects/-work-app/lane.jsonl",
+        b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"paired upload\"}}\n",
+    );
+    let push = || {
+        semon()
+            .arg("push")
+            .arg("--claude-home")
+            .arg(f.path("home/claude"))
+            .arg("--codex-home")
+            .arg(f.path("home/codex"))
+            .arg("--copilot-home")
+            .arg(f.path("home/copilot"))
+            .arg("--proc-root")
+            .arg(f.path("home/proc"))
+            .arg("--cache")
+            .arg(f.path("state/index.json"))
+            .env("XDG_CONFIG_HOME", f.path("config"))
+            .env("XDG_STATE_HOME", f.path("state"))
+            .env("HOME", f.path("home"))
+            .env("SEMON_PRICING_REFRESH", "off")
+            .output()
+            .unwrap()
+    };
+    assert_ok(&push(), "push using pair.json defaults");
+    let retained = f.dir().join(format!(
+        "machines/{}/claude/projects/-work-app/lane.jsonl",
+        config.machine
+    ));
+    assert!(
+        fs::read_to_string(&retained)
+            .unwrap()
+            .contains("paired upload")
+    );
+    let revoked = semon()
+        .args(["unpair", "--dir"])
+        .arg(f.dir())
+        .arg(&config.machine)
+        .env("SEMON_PRICING_REFRESH", "off")
+        .output()
+        .unwrap();
+    assert_ok(&revoked, "receiver-side unpair");
+    f.append("home/claude/projects/-work-app/lane.jsonl", b"{}\n");
+    assert!(!push().status.success());
+    assert!(retained.exists());
+    let forgotten = semon()
+        .arg("unpair")
+        .env("XDG_CONFIG_HOME", f.path("config"))
+        .env("SEMON_PRICING_REFRESH", "off")
+        .output()
+        .unwrap();
+    assert_ok(&forgotten, "machine-side unpair");
+    assert!(!path.exists());
+}
+
 const SECRET: &str = "sk-ant-api03-SECRETSECRETSECRETSECRETSECRET";
 const LOG: &str = "claude/projects/-work-app/lane.jsonl";
 const ROLLOUT: &str = "codex/sessions/2026/09/29/rollout-2026-09-29T10-00-00-cx.jsonl";

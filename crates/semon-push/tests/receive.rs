@@ -271,7 +271,7 @@ fn append_body(path: &str, before: &[u8], offset: u64, bytes: &[u8]) -> Vec<u8> 
 }
 
 const LOG: &str = "projects/-work/lane.jsonl";
-const APPEND: &str = "/v1/mirror/append";
+const APPEND: &str = "/v1/push/append";
 
 #[test]
 fn an_append_is_answered_over_http() {
@@ -344,7 +344,7 @@ fn unknown_and_revoked_tokens_are_401() {
     assert_eq!(
         post(
             receiving.address,
-            "/v1/mirror/facts",
+            "/v1/push/facts",
             Some(&tokens[0]),
             &facts
         )
@@ -355,7 +355,7 @@ fn unknown_and_revoked_tokens_are_401() {
     assert_eq!(
         post(
             receiving.address,
-            "/v1/mirror/facts",
+            "/v1/push/facts",
             Some(&tokens[1]),
             &facts
         )
@@ -406,8 +406,11 @@ fn only_post_to_the_two_endpoints() {
     for route in [
         "/",
         "/v1/mirror",
-        "/v1/mirror/append/",
-        "/v1/mirror/append?x=1",
+        "/v1/mirror/append",
+        "/v1/mirror/facts",
+        "/v1/mirror/status",
+        "/v1/push/append/",
+        "/v1/push/append?x=1",
         "/v1/frames",
     ] {
         assert_eq!(
@@ -430,11 +433,86 @@ fn only_post_to_the_two_endpoints() {
 }
 
 #[test]
+fn simple_pair_route_is_strict_capped_and_works_without_tls() {
+    let (receiving, _) = receiving(&[]);
+    let code = semon_push::push_pair::issue(&receiving.dir, semon_push::push_pair::now().unwrap())
+        .unwrap();
+    assert_eq!(
+        post(
+            receiving.address,
+            "/v1/pair",
+            None,
+            &vec![b' '; semon_push::push_pair::MAX_BODY + 1]
+        )
+        .status,
+        413
+    );
+    assert_eq!(
+        post(
+            receiving.address,
+            "/v1/pair",
+            None,
+            br#"{"code":"x","machine":"machine-6754a9c100000001","extra":true}"#
+        )
+        .status,
+        400
+    );
+    let body =
+        serde_json::to_vec(&json!({"code":code.expose(),"machine":"machine-6754a9c100000001"}))
+            .unwrap();
+    let reply = post(receiving.address, "/v1/pair", None, &body);
+    assert_eq!(reply.status, 200);
+    let token = reply.body["bearer"].as_str().unwrap();
+    let good = append_body(LOG, b"", 0, b"paired\n");
+    assert_eq!(
+        post(receiving.address, APPEND, Some(token), &good).status,
+        200
+    );
+    let retained = receiving
+        .dir
+        .join("machines/machine-6754a9c100000001")
+        .join("claude")
+        .join(LOG);
+    assert_eq!(fs::read(&retained).unwrap(), b"paired\n");
+    assert_eq!(
+        post(receiving.address, "/v1/push/facts", Some(token), br#"{}"#).status,
+        400
+    );
+    semon_push::push_pair::revoke(
+        &receiving.dir,
+        "machine-6754a9c100000001",
+        semon_push::push_pair::now().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        post(receiving.address, "/v1/push/facts", Some(token), br#"{}"#).status,
+        401
+    );
+    assert_eq!(fs::read(retained).unwrap(), b"paired\n");
+}
+
+#[test]
+fn plain_http_receiver_may_bind_all_interfaces() {
+    let dir = std::env::temp_dir().join(format!(
+        "semon-http-bind-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    semon_push::push_pair::initialize(&dir).unwrap();
+    let mut options = ServeOptions::new(&dir);
+    options.listen = "0.0.0.0:0".parse().unwrap();
+    let server = Server::bind(&options).unwrap();
+    assert_eq!(server.scheme(), "http");
+    drop(server);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn malformed_bodies_are_400() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     let bodies: [&[u8]; 5] = [b"", b"{", b"[1,2]", b"\"text\"", b"\xff"];
     for body in bodies {
-        for route in [APPEND, "/v1/mirror/facts"] {
+        for route in [APPEND, "/v1/push/facts"] {
             let answer = post(receiving.address, route, Some(&tokens[0]), body);
             assert_eq!(answer.status, 400, "{route} {body:?}");
             assert!(answer.body["error"].is_string());
@@ -890,7 +968,7 @@ fn a_peer_that_never_reads_its_answer_is_closed_at_the_write_deadline() {
 fn status_head_advertises_post_without_body_and_unknown_routes_stay_unsupported() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     let head = format!(
-        "HEAD /v1/mirror/status HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        "HEAD /v1/push/status HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
         receiving.address, tokens[0]
     );
     let answer = exchange(receiving.address, head.as_bytes());
@@ -903,11 +981,11 @@ fn status_head_advertises_post_without_body_and_unknown_routes_stay_unsupported(
     );
     assert!(answer.body.is_null());
     assert_eq!(answer.body_bytes, 0, "HEAD must not send an error body");
-    let unknown = head.replace("/v1/mirror/status", "/v1/mirror/unknown-status");
+    let unknown = head.replace("/v1/push/status", "/v1/push/unknown-status");
     assert_eq!(exchange(receiving.address, unknown.as_bytes()).status, 401);
     let unauthorized = post(
         receiving.address,
-        "/v1/mirror/status",
+        "/v1/push/status",
         Some("revoked-token"),
         b"{}",
     );

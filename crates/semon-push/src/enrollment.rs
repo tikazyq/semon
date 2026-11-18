@@ -193,6 +193,7 @@ pub struct Registry {
     format: u32,
     revision: u64,
     pub(crate) endpoint: Option<String>,
+    pub(crate) push_pair: crate::push_pair::State,
     pub(crate) machines: Vec<semon_sessions::received_registry::ReceivedMachine>,
     pub(crate) machine_audit: Vec<semon_sessions::received_registry::MachineAudit>,
     pub(crate) enrollments: Vec<Enrollment>,
@@ -212,6 +213,7 @@ impl Registry {
             endpoint: None,
             machines: vec![],
             machine_audit: vec![],
+            push_pair: crate::push_pair::State::default(),
             enrollments: vec![],
             credentials: vec![],
             pairing_receipts: vec![],
@@ -296,6 +298,7 @@ impl Registry {
             endpoint,
             machines: machine_records,
             machine_audit: vec![],
+            push_pair: crate::push_pair::State::default(),
             enrollments,
             credentials,
             pairing_receipts: vec![],
@@ -510,12 +513,18 @@ impl Registry {
                 return Err(Error::Invalid);
             }
         }
+        if !self.push_pair.validate(self) {
+            return Err(Error::Invalid);
+        }
         crate::pairing::validate_receipts(self)?;
         self.validate_renewal()?;
         Ok(())
     }
     fn follows(&self, old: &Self) -> Result<()> {
         if self.latest < old.latest || self.next_sequence < old.next_sequence {
+            return Err(Error::Terminal);
+        }
+        if !self.push_pair.follows(&old.push_pair) {
             return Err(Error::Terminal);
         }
         if !self.machine_audit.starts_with(&old.machine_audit) {
@@ -667,7 +676,7 @@ impl Registry {
         Ok(())
     }
 }
-fn opaque(s: &str) -> bool {
+pub(crate) fn opaque(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
