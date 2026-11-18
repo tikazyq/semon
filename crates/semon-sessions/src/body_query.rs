@@ -248,20 +248,24 @@ fn search(indexes: &[Index], request: Search, deadline: Instant) -> Result<Value
     });
     truncated |= ranked.len() > request.limit;
     let mut result = json!({"hits":[],"truncated":truncated,"data_notice":DATA_NOTICE});
-    for (_, hit) in ranked.into_iter().take(request.limit) {
-        result["hits"]
-            .as_array_mut()
-            .expect("hits array")
-            .push(serde_json::to_value(hit).expect("hit serializes"));
-        if serde_json::to_vec(&result)
+    // Reserve the longer `false` spelling even when already truncated. Count
+    // each serialized hit once instead of serializing the growing response on
+    // every iteration (quadratic work for long UIDs).
+    let mut bytes =
+        serde_json::to_vec(&json!({"hits":[],"truncated":false,"data_notice":DATA_NOTICE}))
             .map_err(|_| unavailable())?
-            .len()
-            > SEARCH_BYTES
-        {
-            result["hits"].as_array_mut().expect("hits array").pop();
+            .len();
+    for (_, hit) in ranked.into_iter().take(request.limit) {
+        let hit = serde_json::to_value(hit).expect("hit serializes");
+        let hits = result["hits"].as_array_mut().expect("hits array");
+        let added = serde_json::to_vec(&hit).map_err(|_| unavailable())?.len()
+            + usize::from(!hits.is_empty());
+        if bytes + added > SEARCH_BYTES {
             result["truncated"] = json!(true);
             break;
         }
+        bytes += added;
+        hits.push(hit);
     }
     Ok(result)
 }

@@ -548,8 +548,13 @@ fn response_byte_caps_stop_at_whole_bodies_and_hits() {
     }
     let result = request(vec![index], "search", json!({"query":"needle","limit":200})).unwrap();
     assert_eq!(result["truncated"], true);
-    assert!(result["hits"].as_array().unwrap().len() < 200);
-    assert!(serde_json::to_vec(&result).unwrap().len() <= SEARCH_BYTES);
+    let hits = result["hits"].as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits.len() < 200);
+    let bytes = serde_json::to_vec(&result).unwrap().len();
+    assert!(bytes <= SEARCH_BYTES);
+    // The next equally sized hit must exceed the budget, including its comma.
+    assert!(bytes + serde_json::to_vec(hits.last().unwrap()).unwrap().len() + 1 > SEARCH_BYTES);
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -55,7 +55,11 @@ struct Server {
 
 impl Server {
     fn start(cache: PathBuf) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_semon"))
+        Self::with_command(Command::new(env!("CARGO_BIN_EXE_semon")), cache)
+    }
+
+    fn with_command(mut command: Command, cache: PathBuf) -> Self {
+        let mut child = command
             .arg("mcp")
             .args(cli_args(cache))
             .stdin(Stdio::piped())
@@ -102,7 +106,10 @@ struct Viewer {
 
 impl Viewer {
     fn start(cache: PathBuf, remote: bool) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_semon"));
+        Self::with_command(Command::new(env!("CARGO_BIN_EXE_semon")), cache, remote)
+    }
+
+    fn with_command(mut command: Command, cache: PathBuf, remote: bool) -> Self {
         command
             .args(["sessions", "--serve", "--listen", "127.0.0.1:0"])
             .args(cli_args(cache));
@@ -315,7 +322,11 @@ fn cli_and_mcp_search_and_view_native_fixture_text() {
         result["bodies"][0]["text"]["untrusted_text"],
         "uniqueftsneedle"
     );
-    let viewer = Viewer::start(cache.clone(), false);
+    let viewer = Viewer::with_command(
+        home.command(env!("CARGO_BIN_EXE_semon")),
+        cache.clone(),
+        false,
+    );
     let (status, headers, result) = viewer.request(
         "POST",
         "/api/asi/search",
@@ -338,10 +349,10 @@ fn cli_and_mcp_search_and_view_native_fixture_text() {
         "uniqueftsneedle"
     );
     assert!(headers.contains("Cache-Control: no-store"));
-    let mut server = Server::start(cache);
+    let mut server = Server::with_command(home.command(env!("CARGO_BIN_EXE_semon")), cache);
     let reply = server.request(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"uniqueftsneedle"}}}));
     let (result, failed) = content(&reply);
-    assert!(!failed);
+    assert!(!failed, "{result}");
     assert_eq!(result["hits"].as_array().unwrap().len(), 1);
 }
 
