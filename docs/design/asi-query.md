@@ -230,10 +230,15 @@ still tokenizes paths, and Hub never receives bodies.
 The current local result is `{"bodies":[…],"truncated":false,"data_notice":…}`.
 Each body carries the same full identity fields as a search hit and
 `text: {"untrusted_text": "…"}`. Local results are capped at 256 KiB and each body
-at 65,536 characters, with explicit `truncated`. The ASI durable store (#560) does
-not exist yet: `label/`, `adjudication/`, `lane/` and `intervention/` targets return
-`not_found` with `detail: durable_not_implemented`. They are never resolved through
-SQL or unrelated annotation stores.
+at 65,536 characters, with explicit `truncated`. Durable `label/`,
+`adjudication/`, `lane/` and `intervention/` targets read only declared body columns
+from the origin's `asi-durable.sqlite3`, through the same admitted body worker.
+These author-assigned UIDs require exactly one admitted origin namespace; multiple
+indexes refuse with `invalid_argument` before durable I/O. Each durable result body
+has `body_uid`, `namespace`, `part` (the column name) and wrapped `text`; `part` may
+select `mechanism_text`, `reason`, `title`, `hypothesis` or `guardrails`. Missing
+stores or rows return `not_found`. These reads never create or write the durable
+store and never resolve through analytics SQL or unrelated annotation stores.
 
 Remote view is an origin-rendered, bounded **typed** transcript page or field,
 not HTML or native bytes. The origin pins the native Catalog and slot recipes and
@@ -285,7 +290,7 @@ records; cancellation/source changes during a read publish no invalid partial pa
 | `capability_unavailable` | Remote search before federated coverage/audit, or search/view on Hub |
 | `body_unavailable` | Remote view cannot supply evidence; closed reason distinguishes retryable `origin_offline` from permanent `source_missing` |
 | `stale_generation` | Requested source, activity, transcript or export-view generation no longer matches |
-| `not_found` | Unknown UID in `view`, including durable targets pending #560 |
+| `not_found` | Unknown UID or absent durable body in `view` |
 | `not_materialized` | Origin search/view before the first analytics materialization creates its namespace |
 
 ## Prompt-injection safety

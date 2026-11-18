@@ -101,6 +101,7 @@ pub struct Request {
 struct Index {
     connection: Connection,
     namespace: String,
+    state: PathBuf,
 }
 
 fn open(path: &std::path::Path, deadline: Instant) -> Result<Index, Value> {
@@ -143,6 +144,7 @@ fn open(path: &std::path::Path, deadline: Instant) -> Result<Index, Value> {
     Ok(Index {
         connection,
         namespace: encode_component(&namespace),
+        state: state.to_path_buf(),
     })
 }
 
@@ -265,23 +267,72 @@ fn search(indexes: &[Index], request: Search, deadline: Instant) -> Result<Value
 }
 
 fn view(indexes: &[Index], request: View, deadline: Instant) -> Result<Value, Value> {
+    let durable = ["label/", "adjudication/", "lane/", "intervention/"]
+        .iter()
+        .any(|prefix| request.uid.starts_with(prefix));
     if request.uid.is_empty()
         || request.uid.len() > 32 * 1024
-        || !valid_part(request.part.as_deref())
+        || if durable {
+            request.part.as_deref().is_some_and(|part| {
+                !matches!(
+                    part,
+                    "mechanism_text" | "reason" | "title" | "hypothesis" | "guardrails"
+                )
+            })
+        } else {
+            !valid_part(request.part.as_deref())
+        }
     {
         return Err(invalid());
     }
-    // The ASI durable store (#560) is not implemented. Never route these UIDs
-    // to transcript storage or expose arbitrary analytics fields as bodies.
-    if ["label/", "adjudication/", "lane/", "intervention/"]
-        .iter()
-        .any(|prefix| request.uid.starts_with(prefix))
-    {
-        return Err(error(
-            "not_found",
-            "Durable body target does not exist",
-            "durable_not_implemented",
-        ));
+    if durable {
+        // These author-assigned UIDs are relative to one admitted origin. Never
+        // choose an arbitrary store when the host admitted multiple namespaces.
+        if indexes.len() != 1 {
+            return Err(error(
+                "invalid_argument",
+                "Durable view requires one origin namespace",
+                "namespace",
+            ));
+        }
+        let mut result = json!({"bodies":[],"truncated":false,"data_notice":DATA_NOTICE});
+        let bodies = semon_asi::durable::bodies(&indexes[0].state, &request.uid, deadline)
+            .map_err(|_| error("store_unavailable", "Durable bodies unavailable", "durable"))?;
+        for body in bodies {
+            if request
+                .part
+                .as_deref()
+                .is_some_and(|part| part != body.field)
+            {
+                continue;
+            }
+            result["bodies"]
+                .as_array_mut()
+                .expect("bodies array")
+                .push(json!({
+                    "body_uid":request.uid,"namespace":indexes[0].namespace,"part":body.field,
+                    "text":{"untrusted_text":body.text}
+                }));
+            result["truncated"] = json!(result["truncated"] == true || body.truncated);
+            if serde_json::to_vec(&result)
+                .map_err(|_| unavailable())?
+                .len()
+                > VIEW_BYTES
+            {
+                result["bodies"].as_array_mut().expect("bodies array").pop();
+                result["truncated"] = json!(true);
+                break;
+            }
+        }
+        if result["bodies"]
+            .as_array()
+            .expect("bodies array")
+            .is_empty()
+            && result["truncated"] != true
+        {
+            return Err(error("not_found", "Unknown durable body UID", "uid"));
+        }
+        return Ok(result);
     }
     let mut result = json!({"bodies":[],"truncated":false,"data_notice":DATA_NOTICE});
     for index in indexes {

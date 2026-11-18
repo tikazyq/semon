@@ -22,6 +22,65 @@ fn fixture() -> (
 }
 
 #[test]
+fn adjudication_precedes_a_later_model_assertion() {
+    use crate::durable::{Adjudication, Label, Writer};
+    let root = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(root.path()).unwrap();
+    let mut label = Label {
+        id: "first".into(),
+        target_type: "lane".into(),
+        target_id: "lane/work".into(),
+        field: "outcome".into(),
+        value: "achieved".into(),
+        mechanism_text: Some("private".into()),
+        evidence_step_ids: vec![],
+        labeler: "model:fixture".into(),
+        taxonomy_version: 2,
+        confidence: Some(0.8),
+        created_at: 100,
+    };
+    writer.insert_label(&label).unwrap();
+    writer
+        .insert_adjudication(&Adjudication {
+            id: "decision".into(),
+            label_ids: vec!["first".into()],
+            target_type: label.target_type.clone(),
+            target_id: label.target_id.clone(),
+            field: label.field.clone(),
+            taxonomy_version: 2,
+            created_at: 100,
+            final_value: "partial".into(),
+            adjudicator: "reviewer".into(),
+            reason: Some("private reason".into()),
+        })
+        .unwrap();
+    label.id = "later".into();
+    label.created_at = 200;
+    writer.insert_label(&label).unwrap();
+    let store_root = root.path().join("analytics-store");
+    let mut store = Store::open(&store_root).unwrap();
+    let mut update = crate::Update::default();
+    crate::durable::append_outbox(&root.path().join(crate::durable::FILE_NAME), &mut update)
+        .unwrap();
+    store.publish(&update).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let db = engine::setup(&store_root, store.manifest(), scratch.path(), "1GiB").unwrap();
+    let (value, labeller): (String, String) = db
+        .query_row("SELECT value,labeller FROM current_label", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(value, "partial");
+    assert_eq!(labeller, "human:reviewer");
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM fact_label", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
 fn refusal_classes_are_checked_recursively_before_binding() {
     let (_dir, _store, _scratch, db, _) = fixture();
     let raw = ast::serialize_sql(&db, "SELECT count(*) FROM fact_step").unwrap();

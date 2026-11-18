@@ -611,13 +611,22 @@ checkpoint; this read-only adapter never recreates deleted data or resets custod
 
 ## Durable state
 
-`asi-durable.sqlite3` holds `label`, `adjudication`, `link`, `lane`,
-`work_item`, `change`, `outcome`, `intervention` and `assignment`
-(methodology §1.1), keyed by UIDs.
+`<index parent>/asi-durable.sqlite3` holds `label`, `adjudication`, `link`,
+`lane`, `work_item`, `change`, `outcome`, `intervention` and `assignment`
+(methodology §1.1). Every table has an independent author-assigned text `id`, never
+a derived key, and a `revision`. `semon-asi::durable::TABLES` declares every
+column and its categorical/body class; `column_class` persists that declaration.
+`durable_state` stores the exact `semon-asi-durable-1` format stamp and revision.
+The file lives outside analytics-store and survives analytics reset.
 
 - **Writes.** WAL, `synchronous=FULL`, and a single author-owned writer through
   `semon-asi`. Label assertions and adjudications are insert-only, enforced by
-  triggers; categorical exports retain authorship and contributor policies.
+  triggers (including replacement refusal). `durable::Writer` holds
+  `asi-durable.lock`, offers typed `insert_label`/`insert_adjudication`, and `put`
+  for the other declared entities. Failed writes roll back the revision too.
+  Authoring CLI/MCP and receiver adjudication are not implemented. Local
+  categorical projection retains authorship; governed federation still refuses
+  `fact_label` until its contributor-policy export contract is implemented.
 - **Rebuilds** never open it for writing. A format mismatch refuses; preserve
   or export the durable state without automatic reset.
 - **Body columns** (`label.mechanism_text`, `adjudication.reason`,
@@ -629,7 +638,20 @@ checkpoint; this read-only adapter never recreates deleted data or resets custod
   above the checkpoint (categorical columns only) to `fact_label` generation
   files. Labels are append-only, so `fact_label` isn't filtered by the session
   live map, and labels on lanes or work items need no session at all.
-  `semon asi backup PATH` copies the file with the SQLite online backup API.
+  Adjudication rows persist target type/UID, field, taxonomy version and
+  `created_at`; every referenced label must agree on those fields. Each exports
+  one assertion with `labeller = human:<adjudicator>`, final value and null
+  confidence. Exported label IDs use `label/<id>` or `adjudication/<id>` to avoid
+  collisions between the independent author tables. `current_label` prioritizes
+  human assertions before revision/time, including over later model assertions.
+  Each cycle uses one read-only durable snapshot and commits its high-water mark
+  with the analytics manifest; a durable commit after that snapshot is exported
+  on the next cycle. Rebuilding analytics starts from revision zero without
+  creating or writing durable state.
+  `semon asi backup PATH [--cache PATH]` copies the file with the SQLite online
+  backup API, including committed WAL records while the author writer is open.
+  An existing destination is refused; unsupported format stamps are refused
+  before destination creation. No reset or migration runs on open.
 
 ## Hub export (phase 3)
 

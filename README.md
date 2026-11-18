@@ -125,7 +125,7 @@ The focused native tools read a window of recent logs: only the log files modifi
 | `stalls` | `idle_minutes`, `since` | sessions quiet for that long that are working, wait on a question, or whose process died while its pid file said busy, each with a `stall_reason` |
 | `sql` | `query`, `params`, `limit`, `timeout_ms` | read-only DuckDB SQL over the current local analytics snapshot (build with `--features asi-query`) |
 | `search` | `query`, `repo`, `harness`, `part`, `since`, `until`, `limit` | origin-local FTS5 hits with untrusted snippets (build with `--features asi-query`) |
-| `view` | `uid`, `part` | focused origin-local body, step or turn text by full ASI UID (build with `--features asi-query`) |
+| `view` | `uid`, `part` | focused origin-local body, step, turn or durable author text by ASI UID (build with `--features asi-query`) |
 | `schema` | `table` | generated ASI analytics schema reference (build with `--features asi-query`) |
 
 `sql` and `schema` read the current local analytics snapshot or generated schema rather than the native-log window; they return compact JSON by default (`--json` is accepted but redundant). `sql --format tsv` prints a tab-delimited header and rows; tabs, newlines and carriage returns in column names and values become spaces. Typed query failures print `{"error":{"code","message","detail"}}` on stdout and exit 1; successful commands exit 0. MCP exposes the generated JSON reference at `semon://asi/schema`. `search` and `view` also default to compact JSON and require materialization; their text is wrapped as untrusted data. Search time filters use inclusive UTC milliseconds (`--since` and `--until`). Remote body queries are refused.
@@ -143,6 +143,21 @@ semon query stalls --idle-minutes 30
 semon query list_sessions --since 90d --newer-than 60d   # a wider window
 semon query get_session SESSION_ID --all                 # every log file
 ```
+
+Author-owned ASI records live beside the index in `asi-durable.sqlite3`, outside
+analytics-store. The Rust `semon_asi::durable::Writer` API writes labels,
+adjudications, links, lanes, work items, changes, outcomes, interventions and
+assignments using independent author-assigned IDs. Labels and adjudications are
+insert-only. Materialization reads their revision outbox and publishes categorical
+`fact_label` rows; mechanisms, reasons, titles, hypotheses and guardrails remain
+private body fields. `semon query view label/ID` (also `adjudication/ID`, `lane/ID`
+and `intervention/ID`) reads those fields through the origin body worker after
+materialization, requiring exactly one admitted origin. There is no authoring
+CLI/MCP surface yet. An unsupported durable format refuses without reset.
+
+`semon asi backup PATH [--cache PATH]` makes an online SQLite backup, including
+committed WAL records, and refuses an existing destination. Analytics rebuild and
+reset never write or remove the durable store.
 
 ## Local analytics materialization
 

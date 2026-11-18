@@ -8,6 +8,7 @@ pub enum Error {
     Parquet(parquet::errors::ParquetError),
     Arrow(arrow::error::ArrowError),
     Json(serde_json::Error),
+    Sqlite(rusqlite::Error),
     /// Another process holds `analytics.lock`.
     WriterBusy,
     /// The caller or the on-disk store broke a documented contract.
@@ -25,6 +26,10 @@ impl Error {
     /// its input or on-disk contract.
     pub fn is_operational(&self) -> bool {
         matches!(self, Self::Io(_))
+            || matches!(self, Self::Sqlite(error) if matches!(error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked |
+                    rusqlite::ErrorCode::SystemIoFailure | rusqlite::ErrorCode::DiskFull |
+                    rusqlite::ErrorCode::CannotOpen)))
             || matches!(
                 self,
                 Self::Parquet(parquet::errors::ParquetError::External(source))
@@ -40,6 +45,7 @@ impl fmt::Display for Error {
             Self::Parquet(error) => write!(f, "analytics parquet: {error}"),
             Self::Arrow(error) => write!(f, "analytics arrow: {error}"),
             Self::Json(error) => write!(f, "analytics manifest: {error}"),
+            Self::Sqlite(error) => write!(f, "durable SQLite: {error}"),
             Self::WriterBusy => write!(f, "another process is the analytics writer"),
             Self::Invalid(message) => write!(f, "analytics store: {message}"),
         }
@@ -53,8 +59,15 @@ impl std::error::Error for Error {
             Self::Parquet(error) => Some(error),
             Self::Arrow(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Sqlite(error) => Some(error),
             Self::WriterBusy | Self::Invalid(_) => None,
         }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
     }
 }
 

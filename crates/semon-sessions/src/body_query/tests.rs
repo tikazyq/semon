@@ -41,6 +41,115 @@ fn request(indexes: Vec<PathBuf>, tool: &str, arguments: Value) -> Result<Value,
 }
 
 #[test]
+fn durable_views_require_one_origin_and_wrap_declared_bodies() {
+    let (root, index) = fixture('a');
+    let mut writer = semon_asi::durable::Writer::open(&root).unwrap();
+    for (table, id, fields) in [
+        (
+            "lane",
+            "work",
+            json!({"id":"work","root_session_id":"origin/claude/native","title":"private title"}),
+        ),
+        (
+            "intervention",
+            "experiment",
+            json!({"id":"experiment","lever":"context","hypothesis":"private hypothesis","primary_metric":"usd","guardrails":"private guardrails","preregistered_at":100}),
+        ),
+    ] {
+        writer
+            .put(table, serde_json::from_value(fields).unwrap())
+            .unwrap();
+        let result = request(
+            vec![index.clone()],
+            "view",
+            json!({"uid":format!("{table}/{id}")}),
+        )
+        .unwrap();
+        assert_eq!(result["data_notice"], DATA_NOTICE);
+        assert!(
+            result["bodies"][0]["text"]["untrusted_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("private")
+        );
+    }
+    let label = semon_asi::durable::Label {
+        id: "assertion".into(),
+        target_type: "lane".into(),
+        target_id: "lane/work".into(),
+        field: "outcome".into(),
+        value: "achieved".into(),
+        mechanism_text: Some("private mechanism".into()),
+        evidence_step_ids: vec![],
+        labeler: "model:fixture".into(),
+        taxonomy_version: 2,
+        confidence: None,
+        created_at: 100,
+    };
+    writer.insert_label(&label).unwrap();
+    writer
+        .insert_adjudication(&semon_asi::durable::Adjudication {
+            id: "decision".into(),
+            label_ids: vec![label.id],
+            target_type: label.target_type,
+            target_id: label.target_id,
+            field: label.field,
+            taxonomy_version: 2,
+            created_at: 100,
+            final_value: "partial".into(),
+            adjudicator: "reviewer".into(),
+            reason: Some("private reason".into()),
+        })
+        .unwrap();
+    for (uid, text) in [
+        ("label/assertion", "private mechanism"),
+        ("adjudication/decision", "private reason"),
+    ] {
+        let result = request(vec![index.clone()], "view", json!({"uid":uid})).unwrap();
+        assert_eq!(result["bodies"][0]["text"]["untrusted_text"], text);
+    }
+    let result = request(
+        vec![index.clone()],
+        "view",
+        json!({"uid":"intervention/experiment","part":"guardrails"}),
+    )
+    .unwrap();
+    assert_eq!(result["bodies"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["bodies"][0]["text"]["untrusted_text"],
+        "private guardrails"
+    );
+    assert_eq!(
+        request(vec![index.clone()], "view", json!({"uid":"lane/missing"})).unwrap_err()["error"]["code"],
+        "not_found"
+    );
+    let (other, other_index) = fixture('b');
+    assert_eq!(
+        request(
+            vec![index.clone(), other_index],
+            "view",
+            json!({"uid":"lane/work"})
+        )
+        .unwrap_err()["error"]["detail"],
+        "namespace"
+    );
+    assert!(
+        execute(
+            Request {
+                indexes: vec![index],
+                tool: "view".into(),
+                arguments: json!({"uid":"lane/work"})
+            },
+            Access::Receiver
+        )
+        .is_err()
+    );
+    drop(writer);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(other).unwrap();
+}
+
+#[test]
 fn image_only_prompt_starts_a_new_claude_turn() {
     let (root, index) = fixture('a');
     let mut batch = crate::events::store::bodies::Batch::default();

@@ -85,7 +85,13 @@ pub fn publish_cycle<C: Clock, I: AnalyticsInput>(
     }
     let complete = batch.complete;
     let generation = update_for_batch(store, batch, versions)
-        .and_then(|update| store.publish(&update))
+        .and_then(|mut update| {
+            crate::durable::append_outbox(
+                &crate::durable::path_for_analytics(store.analytics_dir())?,
+                &mut update,
+            )?;
+            store.publish(&update)
+        })
         .map_err(PublishError::Store)?;
     Ok(PublishProgress {
         generation,
@@ -408,7 +414,7 @@ fn price_observation_timestamps(row: &Row) -> crate::Result<(i64, i64, Option<i6
     }
 }
 
-fn rows_to_batch(table: &'static Table, rows: &[Row]) -> crate::Result<RecordBatch> {
+pub(crate) fn rows_to_batch(table: &'static Table, rows: &[Row]) -> crate::Result<RecordBatch> {
     let columns: crate::Result<Vec<ArrayRef>> = table
         .columns
         .iter()
