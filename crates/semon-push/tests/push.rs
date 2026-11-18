@@ -1233,6 +1233,17 @@ fn a_refused_token_is_reported_even_when_a_stop_comes_with_it() {
 }
 
 #[test]
+fn receiver_urls_keep_explicit_default_ports() {
+    for url in [
+        "https://receiver.example:443",
+        "https://[2001:db8::1]:443",
+        "http://127.0.0.1:80/path",
+    ] {
+        assert_eq!(semon_push::check_url(url).unwrap(), url);
+    }
+}
+
+#[test]
 fn spellings_of_one_receiver_share_one_state_file_and_lock() {
     assert_eq!(
         semon_push::check_url("HTTPS://Mirror.Example/api/Push/").unwrap(),

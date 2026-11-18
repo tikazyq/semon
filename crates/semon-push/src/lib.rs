@@ -274,14 +274,17 @@ pub fn read_token(path: &Path) -> Result<String> {
 
 /// Checks the receiver URL: https, or http on a loopback address only, and
 /// no query or fragment. Returns it normalised: the scheme and host in
-/// lower case, and no trailing slash.
+/// lower case, an explicit port retained, and no trailing slash.
 pub fn check_url(url: &str) -> Result<String> {
+    let (_, rest) = url.split_once("://").ok_or("invalid receiver URL")?;
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or_default();
     let parsed = reqwest::Url::parse(url).map_err(|_| "invalid receiver URL")?;
     if !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || parsed.host().is_none()
+        || authority.contains('@')
     {
         return Err("receiver URL must have a host and no credentials, query or fragment".into());
     }
@@ -290,6 +293,21 @@ pub fn check_url(url: &str) -> Result<String> {
         "http" if parsed.host_str().is_some_and(loopback) => {}
         "http" => return Err("plain http is allowed to a loopback address only".into()),
         _ => return Err("the receiver URL must be https".into()),
+    }
+    let explicit_port = authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    // The URL parser elides default ports, but signed enrollment custody
+    // uses the normalized endpoint with its port (including :443).
+    if let Some(port) = explicit_port
+        .filter(|port| parsed.port().is_none() && parsed.port_or_known_default() == Some(*port))
+    {
+        return Ok(format!(
+            "{}://{}:{port}{}",
+            parsed.scheme(),
+            parsed.host_str().expect("checked host"),
+            parsed.path().trim_end_matches('/')
+        ));
     }
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
