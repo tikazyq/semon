@@ -282,7 +282,7 @@ fn reply(
     extra: &[(&str, &str)],
 ) -> io::Result<()> {
     use std::fmt::Write as _;
-    let phrase = tiny_http::StatusCode(status).default_reason_phrase();
+    let phrase = super::reason(status);
     let mut head = format!(
         "HTTP/1.1 {status} {phrase}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()

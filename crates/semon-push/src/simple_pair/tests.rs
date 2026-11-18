@@ -239,8 +239,7 @@ fn owner_read_tokens_are_transactional_and_separate_from_pairing() {
     let paired = f.request(code.expose(), 101).unwrap();
     let (id, secret) = read_tokens::create(&f.0, 102).unwrap();
     let (other_id, other_secret) = read_tokens::create(&f.0, 103).unwrap();
-    let mut store = Store::open(&f.0).unwrap();
-    let active = store.snapshot().unwrap();
+    let active = Registry::read_current(&f.0).unwrap();
     assert_eq!(active.read_token_id(secret.expose()), Some(id.as_str()));
     assert!(active.read_token_active(&id));
     assert!(active.read_token_id(&paired.token).is_none());
@@ -248,7 +247,7 @@ fn owner_read_tokens_are_transactional_and_separate_from_pairing() {
     assert!(!f.accepts(secret.expose()));
 
     read_tokens::revoke(&f.0, &id, 104).unwrap();
-    let current = store.snapshot().unwrap();
+    let current = Registry::read_current(&f.0).unwrap();
     assert!(current.read_token_id(secret.expose()).is_none());
     assert!(!current.read_token_active(&id));
     assert_eq!(
@@ -256,7 +255,11 @@ fn owner_read_tokens_are_transactional_and_separate_from_pairing() {
         Some(other_id.as_str())
     );
     assert!(f.accepts(&paired.token));
-    assert!(read_tokens::revoke(&f.0, &id, 105).is_err());
+    assert!(matches!(
+        read_tokens::revoke(&f.0, &id, 105),
+        Err(Error::Invalid)
+    ));
+    let mut store = Store::open(&f.0).unwrap();
     assert!(matches!(
         store.commit(current.revision(), &active),
         Err(Error::Terminal)

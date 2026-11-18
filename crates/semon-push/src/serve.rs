@@ -838,6 +838,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        303 => "See Other",
+        304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -848,7 +850,10 @@ fn reason(status: u16) -> &'static str {
         411 => "Length Required",
         413 => "Content Too Large",
         417 => "Expectation Failed",
+        423 => "Locked",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         505 => "HTTP Version Not Supported",
         507 => "Insufficient Storage",
         _ => "Internal Server Error",
