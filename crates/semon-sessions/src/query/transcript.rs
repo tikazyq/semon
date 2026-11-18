@@ -794,14 +794,12 @@ fn read_inner(
     let position = |name: &str| integer(args, name).map(|value| value.max(0) as usize);
     let anchor = tx::Anchor::of(position("before"), position("after"), string(args, "turn"))
         .ok_or_else(|| QueryError::invalid("before, after and turn are exclusive"))?;
-    let (forward, from) = match &anchor {
-        tx::Anchor::Last if step_anchor.is_some() => {
-            (true, step_anchor.expect("step resolved").slot)
-        }
-        tx::Anchor::Last => (false, total),
-        tx::Anchor::Before(before) => (false, (*before).min(total)),
-        tx::Anchor::After(after) => (true, (*after).min(total)),
-        tx::Anchor::Turn(turn) => {
+    let (forward, from) = match (step_anchor, &anchor) {
+        (Some(step_anchor), _) => (true, step_anchor.slot),
+        (None, tx::Anchor::Last) => (false, total),
+        (None, tx::Anchor::Before(before)) => (false, (*before).min(total)),
+        (None, tx::Anchor::After(after)) => (true, (*after).min(total)),
+        (None, tx::Anchor::Turn(turn)) => {
             let turn_column = if history.is_some() {
                 "json_extract(metadata,'$.turn')"
             } else {

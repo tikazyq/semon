@@ -96,7 +96,8 @@ pub(crate) fn resolve(
     } else {
         ("session_slot_projections", "session_slots", "0")
     };
-    let header: Option<(String, u32, Option<String>, i64, bool)> = tx.query_row(
+    type Header = (String, u32, Option<String>, i64, bool);
+    let header: Option<Header> = tx.query_row(
         &format!("SELECT generation,version,source_generation,total,{incomplete} FROM {headers} WHERE session_key=?1"),
         [key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).optional()?;
@@ -112,10 +113,10 @@ pub(crate) fn resolve(
     // Slots carry only exact native evidence. Prefer a matching Claude UUID
     // over the usage position even if the usage position sorts first.
     use crate::events::session_activity::Usage;
-    let matched: Option<(usize, &str)> = match (&step.id, usage) {
+    let matched: Option<(i64, &str)> = match (&step.id, usage) {
         (ActivityStepId::Claude(_), Usage::Claude(usage)) if usage.record_ids.len() <= 256 => {
             let ids = encode(&usage.record_ids)?;
-            let slot: Option<usize> = tx.query_row(
+            let slot: Option<i64> = tx.query_row(
                 &format!("SELECT slot FROM {table} WHERE session_key=?1 AND slot>=0 AND slot<?2
                     AND json_valid(metadata) AND json_extract(metadata,'$.activity_record.Claude') IN (SELECT value FROM json_each(?3))
                     ORDER BY slot LIMIT 1"), params![key, total, ids], |row| row.get(0),
@@ -143,13 +144,15 @@ pub(crate) fn resolve(
         ).optional()?,
         _ => None,
     };
-    Ok(matched
-        .map(|(slot, basis)| Anchor {
-            slot,
-            transcript_generation,
-            basis,
-        })
-        .ok_or(Refusal::NoExactRecord))
+    let Some((slot, basis)) = matched else {
+        return Ok(Err(Refusal::NoExactRecord));
+    };
+    let slot = usize::try_from(slot).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(Ok(Anchor {
+        slot,
+        transcript_generation,
+        basis,
+    }))
 }
 
 pub(crate) fn viewer_reply(
