@@ -571,11 +571,11 @@ fn asi_tools() -> Vec<semon_sessions::QueryTool> {
                 "properties": {
                     "query": {"type": "string", "description": "FTS5 match expression."},
                     "repo": {"type": "string", "description": "ASI repository key."},
-                    "harness": {"type": "string"},
-                    "part": {"type": "string", "enum": ["user", "assistant", "command", "tool_output", "error"]},
-                    "since": {"type": "string", "format": "date-time"},
-                    "until": {"type": "string", "format": "date-time"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20}
+                    "harness": {"type": "string", "description": "Filter by native harness."},
+                    "part": {"type": "string", "enum": ["user", "assistant", "command", "tool_output", "error"], "description": "Filter by body part."},
+                    "since": {"type": "string", "description": "Inclusive RFC 3339 lower time bound."},
+                    "until": {"type": "string", "description": "Exclusive RFC 3339 upper time bound."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "Maximum number of hits."}
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -588,8 +588,8 @@ fn asi_tools() -> Vec<semon_sessions::QueryTool> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "uid": {"type": "string"},
-                    "part": {"type": "string", "enum": ["user", "assistant", "command", "tool_output", "error"]}
+                    "uid": {"type": "string", "description": "Namespace-qualified body, step or turn UID."},
+                    "part": {"type": "string", "enum": ["user", "assistant", "command", "tool_output", "error"], "description": "Filter by body part."}
                 },
                 "required": ["uid"],
                 "additionalProperties": false

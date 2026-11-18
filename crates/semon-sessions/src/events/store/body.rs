@@ -39,14 +39,24 @@ CREATE TRIGGER body_delete AFTER DELETE ON body BEGIN
 END;
 "#;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Batch {
     harness: String,
     records: Vec<Record>,
     lines: i64,
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for Batch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The staged records can contain private session text.
+        f.debug_struct("Batch")
+            .field("record_count", &self.records.len())
+            .field("lines", &self.lines)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
 struct Record {
     // A physical record ordinal is independent of the path and byte lengths.
     ord: i64,

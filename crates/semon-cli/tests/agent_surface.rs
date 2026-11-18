@@ -727,6 +727,8 @@ fn semon_mcp_speaks_the_protocol_and_serves_every_tool() {
         "stalls",
         "sql",
         "schema",
+        "search",
+        "view",
     ];
     #[cfg(not(feature = "asi-query"))]
     let expected_tools = [

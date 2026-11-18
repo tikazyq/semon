@@ -9817,7 +9817,11 @@ mod tests {
     // and normalized representations. Full historical Tree maps are no longer
     // the persistence contract; totals, models and active tool state still are.
     fn index_snapshot(index: &FileIndex) -> String {
-        let mut snapshot = index.clone();
+        // Cold parses, tail scans and SQL reloads carry different ingest batches.
+        let mut snapshot = FileIndex {
+            body_batch: Default::default(),
+            ..index.clone()
+        };
         snapshot.tree_summary = index.tree_summary.as_ref().map(|summary| {
             let mut compact = summary.compact(true);
             compact.first = summary.first.clone();
