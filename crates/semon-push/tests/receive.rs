@@ -391,7 +391,7 @@ fn an_oversize_body_is_413_before_it_is_read() {
 }
 
 #[test]
-fn only_post_to_the_two_endpoints() {
+fn push_routes_require_post_and_viewer_routes_require_read_authority() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     let answer = exchange(
         receiving.address,
@@ -403,8 +403,30 @@ fn only_post_to_the_two_endpoints() {
     );
     assert_eq!(answer.status, 405);
     assert!(answer.head.contains("Allow: POST"));
+    // The root now belongs to the Viewer. Push credentials cannot authorize
+    // reads, and arbitrary POSTs are not Viewer operations.
+    assert_eq!(
+        post(receiving.address, "/", Some(&tokens[0]), b"{}").status,
+        405
+    );
+    for authorization in [
+        String::new(),
+        format!("Authorization: Bearer {}\r\n", tokens[0]),
+    ] {
+        let get = format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\n{authorization}Connection: close\r\n\r\n",
+            receiving.address
+        );
+        let answer = exchange(receiving.address, get.as_bytes());
+        assert_eq!(answer.status, 401);
+        assert!(answer.head.contains("X-Frame-Options: DENY"));
+    }
+    // Host admission precedes Viewer method and credential checks.
+    assert_eq!(
+        exchange(receiving.address, b"GET / HTTP/1.1\r\n\r\n").status,
+        403
+    );
     for route in [
-        "/",
         "/v1/push",
         "/v1/push/append/",
         "/v1/push/append?x=1",
