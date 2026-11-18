@@ -112,7 +112,7 @@ const LIST_MAX: i64 = 1000;
 pub struct QueryError {
     /// `unknown_tool`, `invalid_arguments`, `unknown_session`,
     /// `unknown_turn`, `outside_window`, `id_conflict`, `capability_unavailable`,
-    /// `stale_projection` or `io`.
+    /// `stale_projection`, `source_changed` or `io`.
     pub code: &'static str,
     pub message: String,
     /// With `outside_window`: where the window starts (epoch ms).
@@ -146,6 +146,8 @@ pub const ACTIVITY_REFUSAL_REASONS: [&str; 6] = [
 ];
 
 impl QueryError {
+    const SOURCE_CHANGED: &str = "source_changed";
+
     pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -164,7 +166,7 @@ impl QueryError {
         self.reason = self.reason.or(match self.code {
             "io" | "unavailable" if exhausted => Some("limit_exceeded"),
             "unavailable" => Some("interrupted"),
-            "io" | "stale_projection" => Some("source_unavailable"),
+            "io" | "stale_projection" | Self::SOURCE_CHANGED => Some("source_unavailable"),
             "unknown_session" => Some("no_activity"),
             "capability_unavailable" => Some("unsupported_storage"),
             _ => None,
@@ -184,6 +186,13 @@ impl QueryError {
     }
 
     pub(crate) fn io(error: &io::Error) -> Self {
+        let error = crate::query_source::original_error(error);
+        if error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<crate::query_source::SourceChanged>())
+        {
+            return Self::new(Self::SOURCE_CHANGED, error.to_string());
+        }
         if let Some(stage) = crate::source_carrier::FailureStage::of(error) {
             return Self::source_failure(stage);
         }
@@ -952,7 +961,22 @@ impl Query {
         let empty = json!({});
         let args = if args.is_null() { &empty } else { args };
         validate_query_call(tool, args)?;
-        self.execute_at(tool, args, now)
+        let result = self.execute_at(tool, args, now);
+        if !self.embedded
+            && result
+                .as_ref()
+                .is_err_and(|error| error.code == QueryError::SOURCE_CHANGED)
+        {
+            let machines = self
+                .sources
+                .machines
+                .iter()
+                .map(|(key, source)| (key.clone(), source.options.clone()))
+                .collect();
+            *self = Self::with_machines(machines);
+            return self.execute_at(tool, args, now);
+        }
+        result
     }
 
     fn execute_at(&mut self, tool: &str, args: &Value, now: i64) -> Result<Value, QueryError> {

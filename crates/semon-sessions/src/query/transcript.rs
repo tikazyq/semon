@@ -130,7 +130,7 @@ fn edge(
                 recipe["kind"].as_str().unwrap_or(""),
                 &mut bytes_left.borrow_mut(),
             )
-            .map_err(|error| records.query_error(error))?;
+            .map_err(|error| records.query_error(&error))?;
             return crate::native_field::preview_record(
                 &field,
                 &text,
@@ -141,7 +141,7 @@ fn edge(
         let remaining = *bytes_left.borrow();
         let bytes = records
             .record_bytes(path, offset, remaining as u64)
-            .map_err(|error| records.query_error(error))?
+            .map_err(|error| records.query_error(&error))?
             .ok_or_else(|| unavailable("Native handoff record unavailable"))?;
         *bytes_left.borrow_mut() = remaining
             .checked_sub(bytes.len())
@@ -567,11 +567,11 @@ fn virtual_read(
             limit,
             &mut tx::Lines::provider(&mut read),
         )
-        .map_err(|error| records.query_error(error))?
+        .map_err(|error| records.query_error(&error))?
     };
     records
         .finish()
-        .map_err(|error| records.query_error(error))?;
+        .map_err(|error| records.query_error(&error))?;
     let snapshot = db.transaction().map_err(unavailable)?;
     if generation(&snapshot)? != catalog_generation
         || serde_json::to_value(
@@ -990,9 +990,10 @@ fn read_inner(
                         .file
                         .as_ref()
                         .ok_or_else(|| unavailable("Turn prompt source unavailable"))?;
-                    let (record, read_bytes) = records
-                        .prompt(file, slot.offset)
-                        .ok_or_else(|| records.query_error("Turn prompt unavailable"))?;
+                    let (record, read_bytes) =
+                        records.prompt(file, slot.offset).ok_or_else(|| {
+                            records.query_error(&io::Error::other("Turn prompt unavailable"))
+                        })?;
                     let remaining = *bytes_left.borrow();
                     *bytes_left.borrow_mut() =
                         remaining.checked_sub(read_bytes as usize).ok_or_else(|| {
@@ -1090,7 +1091,7 @@ fn read_inner(
         }
         records
             .finish()
-            .map_err(|error| records.query_error(error))?;
+            .map_err(|error| records.query_error(&error))?;
         let snapshot = db.transaction().map_err(unavailable)?;
         unchanged(
             &snapshot,
@@ -1221,12 +1222,12 @@ fn read_inner(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock && count < MAX_SLOTS => {
                 count = (count * 2).min(MAX_SLOTS)
             }
-            Err(error) => return Err(records.query_error(error)),
+            Err(error) => return Err(records.query_error(&error)),
         }
     };
     records
         .finish()
-        .map_err(|error| records.query_error(error))?;
+        .map_err(|error| records.query_error(&error))?;
     let snapshot = db.transaction().map_err(unavailable)?;
     unchanged(
         &snapshot,

@@ -1041,6 +1041,108 @@ impl Home {
     }
 }
 
+#[test]
+fn local_query_retries_an_append_during_verification_from_fresh_sources() {
+    use std::io::Write;
+
+    let home = Home::new("racing-query");
+    let path = home.lines(
+        "claude/projects/-work-proj/lead.jsonl",
+        &[human("lead", ts(1, 0), "initial prompt")],
+    );
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = runs.clone();
+    crate::query_source::DURING_VERIFY.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            count.set(count.get() + 1);
+            if count.get() == 1 {
+                let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                writeln!(log, "{}", human("lead", ts(2, 0), "appended prompt")).unwrap();
+            }
+        }));
+    });
+    let mut query = home.query();
+    let result = query.call_at("list_sessions", &json!({}), NOW);
+    crate::query_source::DURING_VERIFY.with(|hook| hook.borrow_mut().take());
+    let answer = result.unwrap();
+    assert!(runs.get() > 1);
+    assert_eq!(answer["sessions"][0]["last_activity"], at(2, 0));
+}
+
+#[test]
+fn local_query_exhausts_retry_on_append_but_never_retries_a_rewritten_prefix() {
+    use std::io::Write;
+
+    for rewrite in [false, true] {
+        let home = Home::new("racing-query");
+        let path = home.lines(
+            "claude/projects/-work-proj/lead.jsonl",
+            &[human("lead", ts(1, 0), "initial prompt")],
+        );
+        let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = runs.clone();
+        crate::query_source::DURING_VERIFY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                count.set(count.get() + 1);
+                if rewrite {
+                    fs::write(
+                        &path,
+                        format!(
+                            "{}\n",
+                            human("lead", ts(2, 0), "rewritten and longer prompt")
+                        ),
+                    )
+                    .unwrap();
+                } else {
+                    let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                    writeln!(log, "{}", human("lead", ts(2, 0), "appended prompt")).unwrap();
+                }
+            }));
+        });
+        let result = home
+            .query()
+            .call_at("stalls", &json!({"idle_minutes": 1}), NOW);
+        crate::query_source::DURING_VERIFY.with(|hook| hook.borrow_mut().take());
+        let error = result.unwrap_err().to_json();
+        if rewrite {
+            assert_eq!(runs.get(), 1);
+            assert_eq!(error["error"]["code"], "io");
+        } else {
+            assert_eq!(runs.get(), 2);
+            assert_eq!(error["error"]["code"], "source_changed");
+        }
+        assert!(error.get("sessions").is_none());
+        assert!(error.get("stalls").is_none());
+    }
+}
+
+#[test]
+fn local_query_names_older_index_and_leaves_it_unchanged() {
+    let home = Home::new("old-index");
+    let path = crate::events::EventCache::path(&home.options.cache);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA user_version=1; CREATE TABLE retained (text TEXT); INSERT INTO retained VALUES ('original');").unwrap();
+    drop(db);
+    let original = fs::read(&path).unwrap();
+
+    let error = home
+        .query()
+        .call_at("list_sessions", &json!({}), NOW)
+        .unwrap_err();
+    for expected in [
+        path.to_str().unwrap(),
+        "older schema",
+        "rename",
+        "-wal",
+        "-shm",
+        "rerun",
+        "native logs available",
+    ] {
+        assert!(error.message.contains(expected), "{error}");
+    }
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
 impl Drop for Home {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);

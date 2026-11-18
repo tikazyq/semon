@@ -2968,7 +2968,13 @@ enum Init {
     Ready,
     NoWal,
     Fresh,
-    Unsupported(&'static str),
+    Unsupported(String),
+}
+
+impl Init {
+    fn unsupported(reason: &str) -> Self {
+        Self::Unsupported(reason.to_owned())
+    }
 }
 
 /// A closed, unchanged identity component can advance without revisiting other
@@ -4140,7 +4146,7 @@ impl SqliteStore {
             db.busy_timeout(BUSY_TIMEOUT).map_err(classify)?;
             let read = db.unchecked_transaction().map_err(classify)?;
             if let Init::Unsupported(reason) = qualify_producer(&read).map_err(classify)? {
-                return Err(Unopened::Unsupported(reason.into()));
+                return Err(Unopened::Unsupported(reason));
             }
             read.commit().map_err(classify)?;
         }
@@ -4167,7 +4173,7 @@ impl SqliteStore {
                     "its filesystem doesn't support WAL".to_owned(),
                 ));
             }
-            Init::Unsupported(reason) => return Err(Unopened::Unsupported(reason.into())),
+            Init::Unsupported(reason) => return Err(Unopened::Unsupported(reason)),
             Init::Fresh => unreachable!("init initializes fresh storage"),
         }
         let store = Self {
@@ -4222,7 +4228,7 @@ impl SqliteStore {
             match qualify_contract(&read).map_err(classify)? {
                 Init::Ready => {}
                 Init::Unsupported(reason) => {
-                    return Err(Unopened::Unsupported(reason.into()));
+                    return Err(Unopened::Unsupported(reason));
                 }
                 _ => {
                     return Err(Unopened::Unsupported(
@@ -4749,16 +4755,19 @@ fn qualify_contract(connection: &Connection) -> rusqlite::Result<Init> {
                 row.get(0)
             })?;
         return Ok(if nonempty {
-            Init::Unsupported("unsupported session index: nonempty schema zero")
+            Init::unsupported("unsupported session index: nonempty schema zero")
         } else {
             Init::Fresh
         });
     }
     if schema < SCHEMA_VERSION {
-        return Ok(Init::Unsupported("unsupported session index: older schema"));
+        let path = connection.path().unwrap_or_default();
+        return Ok(Init::Unsupported(format!(
+            "unsupported session index: older schema at {path:?}. With index users stopped, rename the SQLite file and its -wal and -shm sidecars (if present) to move them aside, then rerun with the original native logs available."
+        )));
     }
     if schema > SCHEMA_VERSION {
-        return Ok(Init::Unsupported("unsupported session index: newer schema"));
+        return Ok(Init::unsupported("unsupported session index: newer schema"));
     }
     let meta: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='meta')",
@@ -4766,7 +4775,7 @@ fn qualify_contract(connection: &Connection) -> rusqlite::Result<Init> {
         |row| row.get(0),
     )?;
     if !meta {
-        return Ok(Init::Unsupported(
+        return Ok(Init::unsupported(
             "unsupported session index: missing metadata",
         ));
     }
@@ -4781,24 +4790,24 @@ fn qualify_contract(connection: &Connection) -> rusqlite::Result<Init> {
         Ok(Some(value)) => match value.parse::<u32>() {
             Ok(version) if value == version.to_string() => version,
             _ => {
-                return Ok(Init::Unsupported(
+                return Ok(Init::unsupported(
                     "unsupported session index: malformed metadata",
                 ));
             }
         },
         Ok(None) => {
-            return Ok(Init::Unsupported(
+            return Ok(Init::unsupported(
                 "unsupported session index: missing metadata",
             ));
         }
         Err(_) => {
-            return Ok(Init::Unsupported(
+            return Ok(Init::unsupported(
                 "unsupported session index: malformed metadata",
             ));
         }
     };
     if parser != CACHE_VERSION {
-        return Ok(Init::Unsupported(
+        return Ok(Init::unsupported(
             "unsupported session index: parser version mismatch",
         ));
     }
@@ -4838,7 +4847,7 @@ fn qualify_contract(connection: &Connection) -> rusqlite::Result<Init> {
         |row| row.get(0),
     )?;
     if publication {
-        return Ok(Init::Unsupported(
+        return Ok(Init::unsupported(
             "unsupported session index: publication version",
         ));
     }
@@ -4850,7 +4859,7 @@ fn qualify_contract(connection: &Connection) -> rusqlite::Result<Init> {
 fn malformed_schema(error: rusqlite::Error) -> rusqlite::Result<Init> {
     if matches!(&error, rusqlite::Error::SqliteFailure(code, _) if code.extended_code == rusqlite::ffi::SQLITE_ERROR)
     {
-        Ok(Init::Unsupported(
+        Ok(Init::unsupported(
             "unsupported session index: malformed schema",
         ))
     } else {
@@ -4913,7 +4922,7 @@ pub(crate) fn current_or_fresh(connection: &Connection) -> io::Result<bool> {
 pub(crate) fn require_current_sql(connection: &Connection) -> rusqlite::Result<()> {
     match qualify_contract(connection)? {
         Init::Ready => Ok(()),
-        Init::Unsupported(reason) => Err(rusqlite::Error::InvalidParameterName(reason.into())),
+        Init::Unsupported(reason) => Err(rusqlite::Error::InvalidParameterName(reason)),
         _ => Err(rusqlite::Error::InvalidParameterName(
             "session index is not initialized".to_owned(),
         )),
@@ -4932,7 +4941,7 @@ fn qualify(connection: &Connection) -> rusqlite::Result<Init> {
         |row| row.get(0),
     )?;
     if unsupported_archive {
-        return Ok(Init::Unsupported(
+        return Ok(Init::unsupported(
             "unsupported session index: archived marker version",
         ));
     }
@@ -5012,7 +5021,7 @@ fn init(connection: &mut Connection) -> rusqlite::Result<Init> {
         return Ok(if fresh {
             Init::NoWal
         } else {
-            Init::Unsupported("unsupported session index: journal mode")
+            Init::unsupported("unsupported session index: journal mode")
         });
     }
     if fresh

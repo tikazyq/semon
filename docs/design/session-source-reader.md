@@ -95,7 +95,11 @@ Each source's local/provider carrier is pinned for the request; a later failure
 never switches carriers. The hosted paged transcript/field and focused MCP
 Catalog/selected reads explicitly opt into this qualification, including when
 the host has no provider. Complete Query, selected Home and `LocalThenProvider`
-retain their existing semantics. Metadata-only observe acknowledges or repairs
+retain their existing local and provider qualification rules. A complete local
+Query retries once from fresh preparation if a file grows during verification
+or a read and its consumed prefix still verifies. A second append race returns
+`error.code: source_changed`. Rewrites and invalid or missing proofs do not
+trigger this retry. Metadata-only observe acknowledges or repairs
 the selected metadata generation; it neither refreshes physical witnesses nor
 proves that a transcript body can be read.
 
@@ -367,8 +371,10 @@ projections. See [cohort-bound index evidence](retained-native-projections.md#co
 
 Normal writable producer opens (complete and scoped/background) refuse older
 indexes with `unsupported session index: older schema`, without mutation or an
-automatic rebuild. Schema 49 follows the same refusal path used by schema 48;
-it adds no operator step. Older/future parser and storage contracts, malformed
+automatic rebuild. The error names the SQLite index. After confirming that the
+original native logs are available and stopping index users, rename the index
+and any `-wal` and `-shm` sidecars to move them aside, then rerun. Older/future
+parser and storage contracts, malformed
 metadata, nonempty schema zero and foreign stores also remain unavailable.
 Selected/focused readers retain read-only qualification and never initialize,
 convert or repair an unsupported index.
