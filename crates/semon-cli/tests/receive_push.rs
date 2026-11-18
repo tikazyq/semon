@@ -559,6 +559,15 @@ fn push_watch_stops_on(name: &str, number: i32) {
         stderr(&second)
     );
 
+    // The first append is acknowledged before the facts worker initializes
+    // SQLite. Wait for the first facts commit before testing idle shutdown.
+    let facts = dir.join("machines/machine-6754a9c1e83f27b4/facts.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !facts.is_file() {
+        assert!(std::time::Instant::now() < deadline, "watch initial facts");
+        thread::sleep(Duration::from_millis(10));
+    }
+
     let interrupted = Command::new("kill")
         .args([format!("-{name}"), watch.id().to_string()])
         .status()
@@ -568,6 +577,7 @@ fn push_watch_stops_on(name: &str, number: i32) {
     assert_eq!(status.signal(), Some(number), "{status:?}");
     let mut stopped = false;
     while let Ok(line) = said.recv_timeout(Duration::from_secs(5)) {
+        assert!(!line.contains("panicked"), "{line}");
         stopped |= line == "semon push: stopped";
     }
     assert!(stopped, "the watch didn't stop through its stop");
