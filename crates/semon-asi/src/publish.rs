@@ -197,6 +197,15 @@ fn update_for_batch<C: Clock>(
             });
         }
     }
+    let (durable_revision, labels) =
+        crate::durable::outbox(store.root(), store.manifest().durable_revision)?;
+    if !labels.is_empty() {
+        let table = &crate::schema::FACT_LABEL;
+        tables.push(TableBatch {
+            table,
+            batch: rows_to_batch(table, &labels)?,
+        });
+    }
     let mut checkpoints = BTreeMap::new();
     checkpoints.insert(batch.namespace, batch.checkpoint);
     Ok(Update {
@@ -207,7 +216,7 @@ fn update_for_batch<C: Clock>(
         source_missing,
         source_restored: source_restored.into_iter().collect(),
         checkpoints,
-        durable_revision: store.manifest().durable_revision,
+        durable_revision,
         versions,
     })
 }
@@ -582,6 +591,70 @@ mod tests {
     ) -> std::result::Result<u64, PublishError<I::Error>> {
         super::publish_cycle(store, input, namespace, versions, InputBudget::default())
             .map(|progress| progress.generation)
+    }
+
+    #[test]
+    fn replays_durable_outbox_after_interrupted_publication() {
+        use crate::durable::{Label, Writer};
+        use crate::schema::FACT_LABEL;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut author = Writer::open(dir.path()).unwrap();
+        author
+            .insert_label(&Label {
+                id: "assertion",
+                target_type: "lane",
+                target_uid: "lane/one",
+                field: "activity",
+                value: "plan",
+                mechanism_text: Some("private mechanism"),
+                evidence_step_ids: &[],
+                labeller: "model:one",
+                taxonomy_version: 1,
+                confidence: Some(0.9),
+                created_at: 100,
+            })
+            .unwrap();
+        drop(author);
+        let mut input = QueuedInput::new([
+            batch("first", full_reconciliation(), vec![]),
+            batch("first", full_reconciliation(), vec![]),
+            batch("second", full_reconciliation(), vec![]),
+        ]);
+        let mut store = Store::open(dir.path()).unwrap();
+        store.fault = Some(Fault::BeforeRename);
+        assert!(publish_cycle(&mut store, &mut input, NAMESPACE, versions()).is_err());
+        assert_eq!(store.manifest().durable_revision, 0);
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
+        publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
+        assert!(store.live_map().is_empty());
+        assert_eq!(store.manifest().durable_revision, 1);
+        let files: Vec<_> = store.manifest().files_of("fact_label").collect();
+        assert_eq!(files.len(), 1);
+        let batches = read_batches(&store.analytics_dir().join(&files[0].path), None).unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        for name in [
+            "mechanism_text",
+            "reason",
+            "title",
+            "hypothesis",
+            "guardrails",
+        ] {
+            assert!(
+                batch.column_by_name(name).is_none(),
+                "unexpected Parquet column {name}"
+            );
+        }
+        let rows = batch_to_rows(&FACT_LABEL, batch).unwrap();
+        assert_eq!(
+            rows[0]["label_id"],
+            Cell::Text(Some("label/assertion".into()))
+        );
+        assert!(!format!("{rows:?}").contains("private mechanism"));
     }
 
     fn full_reconciliation() -> Reconciliation {

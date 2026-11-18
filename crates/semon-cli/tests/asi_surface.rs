@@ -282,6 +282,97 @@ fn content(reply: &Value) -> (Value, bool) {
 }
 
 #[test]
+fn later_model_label_does_not_replace_human_adjudication() {
+    use semon_asi::durable::{Adjudication, Label, Writer};
+
+    let home = fixture::Fixture::new();
+    let cache = home.root.join("state/index.json");
+    let mut writer = Writer::open(&home.root.join("state/analytics-store")).unwrap();
+    let mut label = Label {
+        id: "one",
+        target_type: "lane",
+        target_uid: "lane/example",
+        field: "activity",
+        value: "plan",
+        mechanism_text: Some("private classifier text"),
+        evidence_step_ids: &[],
+        labeller: "model:classifier",
+        taxonomy_version: 1,
+        confidence: Some(0.8),
+        created_at: 100,
+    };
+    writer.insert_label(&label).unwrap();
+    writer
+        .insert_adjudication(&Adjudication {
+            id: "one",
+            label_ids: &[label.id],
+            target_type: label.target_type,
+            target_uid: label.target_uid,
+            field: label.field,
+            final_value: "review",
+            adjudicator: "author",
+            reason: Some("private adjudication reason"),
+            taxonomy_version: label.taxonomy_version,
+            created_at: label.created_at,
+        })
+        .unwrap();
+    label.id = "later";
+    label.created_at = 200;
+    writer.insert_label(&label).unwrap();
+    let output = home
+        .command(env!("CARGO_BIN_EXE_semon"))
+        .args(["analytics", "materialize", "--all", "--proc-root"])
+        .arg(home.root.join("empty-proc"))
+        .arg("--cache")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = cli(
+        &[
+            "query",
+            "sql",
+            "SELECT label_id, value, labeller, revision FROM current_label",
+        ],
+        cache.clone(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["rows"],
+        json!([["adjudication/one", "review", "human:author", 2]])
+    );
+    let output = cli(&["query", "sql", "SELECT * FROM fact_label"], cache.clone());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 3);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
+    let output = cli(&["query", "view", "adjudication/one"], cache);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["bodies"][0]["text"]["untrusted_text"],
+        "private adjudication reason"
+    );
+}
+
+#[test]
 fn cli_and_mcp_search_and_view_native_fixture_text() {
     let home = fixture::Fixture::new();
     home.write("configured-claude/projects/fixture/00000000-0000-4000-8000-000000000001.jsonl", b"{\"type\":\"user\",\"uuid\":\"prompt\",\"sessionId\":\"00000000-0000-4000-8000-000000000001\",\"timestamp\":\"2026-11-10T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"uniqueftsneedle\"}}\n");

@@ -73,22 +73,23 @@ cost         (target_type, target_id, tokens_by_class, model_s, wall_s, usd, pri
 SEMANTIC (many labellers per target)
 label        (id, target_type, target_id, field, value, mechanism_text, evidence_step_ids[],
               labeler[rule:x|model:y|human:z], taxonomy_version, confidence, created_at)
-adjudication (id, label_ids[], final_value, adjudicator, reason)
+adjudication (id, label_ids[], target_type, target_id, field, final_value,
+              adjudicator, reason, taxonomy_version, created_at)
 lever        (target_type, target_id, lever, mapping_version)         -- derived (§3.1)
 
 WORK AND BENEFIT
 lane         (id, title, root_session_id, work_item_id)
 work_item    (id, tracker, ref, value_class, size, priority, opened_at, closed_at)
 change       (id, repo, kind, ref, opened_at, merged_at, reverted_at)
-link         (from_type[session|segment], from_id, change_id,
+link         (id, from_type[session|segment], from_id, change_id,
               method[trailer|commit|push|branch|mention|semantic], evidence[produced|mentioned], confidence)
-outcome      (change_id, ci_on_merge, later_fix_change_id, escaped_defect, survival_30d,
+outcome      (id, change_id, ci_on_merge, later_fix_change_id, escaped_defect, survival_30d,
               window_closed_at)                                       -- null = censored
 
 EXPERIMENTS
 price        (model, valid_from, input, cached, output)
 intervention (id, lever, hypothesis, primary_metric, guardrails, preregistered_at)
-assignment   (intervention_id, unit_type, unit_id, arm, assigned_at)
+assignment   (id, intervention_id, unit_type, unit_id, arm, assigned_at)
 ```
 
 Rules:

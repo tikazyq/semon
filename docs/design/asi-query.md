@@ -228,12 +228,14 @@ plain-field choice applies origin→operator receiver; the settled Hub export ru
 still tokenizes paths, and Hub never receives bodies.
 
 The current local result is `{"bodies":[…],"truncated":false,"data_notice":…}`.
-Each body carries the same full identity fields as a search hit and
+Each transcript body carries the same full identity fields as a search hit and
 `text: {"untrusted_text": "…"}`. Local results are capped at 256 KiB and each body
-at 65,536 characters, with explicit `truncated`. The ASI durable store (#560) does
-not exist yet: `label/`, `adjudication/`, `lane/` and `intervention/` targets return
-`not_found` with `detail: durable_not_implemented`. They are never resolved through
-SQL or unrelated annotation stores.
+at 65,536 characters, with explicit `truncated`. Durable UIDs require exactly one
+admitted origin namespace and are resolved by the same body worker. In a durable
+result, `body_uid` is the requested UID, `part` is the body column name, and
+`session_uid`, `turn_uid`, `step_uid` and `ts` are null. Omit the transcript-only
+`part` filter for durable UIDs. A missing row or a row with no body fields returns
+`not_found`.
 
 Remote view is an origin-rendered, bounded **typed** transcript page or field,
 not HTML or native bytes. The origin pins the native Catalog and slot recipes and

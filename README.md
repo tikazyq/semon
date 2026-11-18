@@ -208,6 +208,12 @@ that every live session UID belongs to the local namespace and only shares the e
 `analytics.lock`; if materialization holds it, export refuses rather than copying a torn
 snapshot.
 
+The origin's author-owned records live in `analytics-store/asi-durable.sqlite3`.
+`semon asi backup PATH [--cache PATH]` makes an online SQLite backup and refuses
+an existing destination. Keep the backup private because it includes author text.
+With `asi-query`, `semon query view label/ID` and the corresponding `adjudication/`,
+`lane/` and `intervention/` UIDs read that text from one local origin.
+
 `semon analytics reset` is explicit destructive maintenance for the analytics store
 only. It requires `--confirm` with the exact `analytics-namespace`, plus exactly one of
 `--verified-export DIR` or the clearly named `--without-export` waiver. A verified bundle

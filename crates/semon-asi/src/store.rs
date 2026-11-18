@@ -302,6 +302,12 @@ impl<C: Clock> Store<C> {
         Ok(())
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        self.analytics
+            .parent()
+            .expect("analytics directory has a store root")
+    }
+
     pub fn analytics_dir(&self) -> &Path {
         &self.analytics
     }
@@ -638,7 +644,7 @@ fn read_live_map_file(path: &Path) -> Result<HashMap<String, i64>> {
     Ok(live)
 }
 
-fn create_durable_dir(path: &Path) -> Result<()> {
+pub(crate) fn create_durable_dir(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return create_durable_dir(&std::env::current_dir()?.join(path));
     }

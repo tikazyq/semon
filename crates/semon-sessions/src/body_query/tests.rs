@@ -245,6 +245,114 @@ fn fixtures_filters_untrusted_text_and_focused_views() {
 }
 
 #[test]
+fn durable_views_read_only_body_fields_from_one_admitted_origin() {
+    use semon_asi::durable::{Adjudication, Intervention, Label, Lane, Writer};
+
+    let (root, index) = fixture('a');
+    let (other_root, other_index) = fixture('b');
+    let mut author = Writer::open(&crate::analytics_store_root(&index).unwrap()).unwrap();
+    author
+        .insert_label(&Label {
+            id: "one",
+            target_type: "lane",
+            target_uid: "lane/one",
+            field: "activity",
+            value: "review",
+            mechanism_text: Some("mechanism body"),
+            evidence_step_ids: &[],
+            labeller: "model:one",
+            taxonomy_version: 1,
+            confidence: None,
+            created_at: 100,
+        })
+        .unwrap();
+    author
+        .insert_adjudication(&Adjudication {
+            id: "one",
+            label_ids: &["one"],
+            target_type: "lane",
+            target_uid: "lane/one",
+            field: "activity",
+            final_value: "review",
+            adjudicator: "one",
+            reason: Some("reason body"),
+            taxonomy_version: 1,
+            created_at: 100,
+        })
+        .unwrap();
+    author
+        .put_lane(&Lane {
+            id: "one",
+            title: "lane body",
+            root_session_id: "session/one",
+            work_item_id: None,
+        })
+        .unwrap();
+    let guardrails = "a".repeat(65_537);
+    author
+        .put_intervention(&Intervention {
+            id: "one",
+            lever: "scope",
+            hypothesis: "hypothesis body",
+            primary_metric: "cost",
+            guardrails: &guardrails,
+            preregistered_at: 100,
+        })
+        .unwrap();
+    for (uid, part, text) in [
+        ("label/one", "mechanism_text", "mechanism body"),
+        ("adjudication/one", "reason", "reason body"),
+        ("lane/one", "title", "lane body"),
+        ("intervention/one", "hypothesis", "hypothesis body"),
+    ] {
+        let response = request(vec![index.clone()], "view", json!({"uid":uid})).unwrap();
+        let body = &response["bodies"][0];
+        assert_eq!(body["body_uid"], uid);
+        assert_eq!(body["part"], part);
+        assert_eq!(body["text"]["untrusted_text"], text);
+        assert!(body["session_uid"].is_null());
+        if uid == "intervention/one" {
+            assert_eq!(response["bodies"][1]["part"], "guardrails");
+            assert_eq!(
+                response["bodies"][1]["text"]["untrusted_text"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                65_536
+            );
+            assert_eq!(response["truncated"], true);
+        }
+    }
+    let arguments = json!({"uid":"label/one"});
+    assert_eq!(
+        request(vec![other_index.clone()], "view", arguments.clone()).unwrap_err()["error"]["code"],
+        "not_found"
+    );
+    assert_eq!(
+        request(vec![index.clone(), other_index], "view", arguments.clone()).unwrap_err()["error"]
+            ["code"],
+        "invalid_argument"
+    );
+    for access in [Access::Receiver, Access::Hub] {
+        assert_eq!(
+            execute(
+                Request {
+                    indexes: vec![index.clone()],
+                    tool: "view".into(),
+                    arguments: arguments.clone()
+                },
+                access
+            )
+            .unwrap_err()["error"]["code"],
+            "capability_unavailable"
+        );
+    }
+    drop(author);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(other_root).unwrap();
+}
+
+#[test]
 fn fusion_uses_namespace_rank_and_is_deterministic() {
     let (left_root, left) = fixture('a');
     let (right_root, right) = fixture('b');

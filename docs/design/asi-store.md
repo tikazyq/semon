@@ -611,25 +611,34 @@ checkpoint; this read-only adapter never recreates deleted data or resets custod
 
 ## Durable state
 
-`asi-durable.sqlite3` holds `label`, `adjudication`, `link`, `lane`,
-`work_item`, `change`, `outcome`, `intervention` and `assignment`
-(methodology §1.1), keyed by UIDs.
+`analytics-store/asi-durable.sqlite3` sits beside `analytics/` and holds
+`label`, `adjudication`, `link`, `lane`, `work_item`, `change`, `outcome`,
+`intervention` and `assignment` (methodology §1.1). Every row has an author-assigned
+`id` primary key. `column_class` declares the class of every column.
 
-- **Writes.** WAL, `synchronous=FULL`, and a single author-owned writer through
-  `semon-asi`. Label assertions and adjudications are insert-only, enforced by
-  triggers; categorical exports retain authorship and contributor policies.
-- **Rebuilds** never open it for writing. A format mismatch refuses; preserve
-  or export the durable state without automatic reset.
-- **Body columns** (`label.mechanism_text`, `adjudication.reason`,
-  `lane.title` and the intervention text) are classed `body`. They never reach
-  analytics or Hub, and are readable only through `view` ([ASI query](asi-query.md)).
-- **Export.** Every write increments a `revision` counter in the same
-  transaction. The analytics manifest checkpoints the last exported revision, so a
-  crash can't lose a label. Each cycle exports the label and adjudication rows
-  above the checkpoint (categorical columns only) to `fact_label` generation
-  files. Labels are append-only, so `fact_label` isn't filtered by the session
-  live map, and labels on lanes or work items need no session at all.
-  `semon asi backup PATH` copies the file with the SQLite online backup API.
+- **Writes.** The `semon_asi::durable::Writer` Rust API acquires one author lock
+  per store. SQLite uses WAL and `synchronous=FULL`. Triggers enforce insert-only
+  label assertions and adjudications. The other author tables accept updates by ID.
+- **Rebuilds** open the durable file read-only. Analytics reset preserves it.
+  Readers and the writer refuse an unsupported format stamp and preserve the file.
+- **Body columns.** `label.mechanism_text`, `adjudication.reason`, `lane.title`,
+  `intervention.hypothesis` and `intervention.guardrails` are classed `body`.
+  They stay in the author store and its private backups. The origin body worker
+  serves them through [`view`](asi-query.md#view).
+- **Publication.** Every author write increments the revision in the same
+  transaction. Each analytics cycle reads the revision and the categorical
+  label and adjudication rows above the manifest's `durable_revision` in one
+  SQLite snapshot. The manifest installs the new checkpoint with the Parquet
+  files, so the next cycle picks up a durable commit interrupted before
+  publication. An adjudication contributes one `fact_label` row with
+  `labeller = human:<adjudicator>` and its own `created_at`. The writer requires
+  every referenced label to match the adjudication's target type and UID,
+  field, taxonomy version and `created_at`. The exported `label_id` is the
+  focus UID (`label/{id}` or `adjudication/{id}`). `current_label` ranks human
+  labels above later model assertions. `fact_label` is independent of the
+  session live map and also supports labels on lanes or work items.
+- **Backup.** `semon asi backup PATH [--cache PATH]` uses SQLite's online backup
+  API and requires a new destination. The backup includes author body text.
 
 ## Hub export (phase 3)
 

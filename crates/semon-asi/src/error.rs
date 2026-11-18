@@ -8,6 +8,8 @@ pub enum Error {
     Parquet(parquet::errors::ParquetError),
     Arrow(arrow::error::ArrowError),
     Json(serde_json::Error),
+    DurableSqlite(rusqlite::Error),
+    DurableFormat,
     /// Another process holds `analytics.lock`.
     WriterBusy,
     /// The caller or the on-disk store broke a documented contract.
@@ -40,6 +42,10 @@ impl fmt::Display for Error {
             Self::Parquet(error) => write!(f, "analytics parquet: {error}"),
             Self::Arrow(error) => write!(f, "analytics arrow: {error}"),
             Self::Json(error) => write!(f, "analytics manifest: {error}"),
+            Self::DurableSqlite(error) => write!(f, "durable SQLite: {error}"),
+            Self::DurableFormat => {
+                write!(f, "unsupported durable store format (preserve the file)")
+            }
             Self::WriterBusy => write!(f, "another process is the analytics writer"),
             Self::Invalid(message) => write!(f, "analytics store: {message}"),
         }
@@ -53,7 +59,8 @@ impl std::error::Error for Error {
             Self::Parquet(error) => Some(error),
             Self::Arrow(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::WriterBusy | Self::Invalid(_) => None,
+            Self::DurableSqlite(error) => Some(error),
+            Self::WriterBusy | Self::DurableFormat | Self::Invalid(_) => None,
         }
     }
 }
@@ -73,6 +80,12 @@ impl From<parquet::errors::ParquetError> for Error {
 impl From<arrow::error::ArrowError> for Error {
     fn from(error: arrow::error::ArrowError) -> Self {
         Self::Arrow(error)
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::DurableSqlite(error)
     }
 }
 
