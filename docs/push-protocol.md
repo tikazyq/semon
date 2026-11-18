@@ -53,8 +53,14 @@ and audits `paired` with `replaced: bool`. It returns **200**:
 
 Tokens have no expiry or renewal. Only their SHA-256 hashes are stored on the
 receiver. Push requests use `Authorization: Bearer <token>`; the token selects
-exactly one machine directory. Unknown/revoked tokens receive **401**. Revocation
-is rechecked on every request, including kept-alive connections.
+exactly one machine directory. Missing, unknown or revoked tokens receive **401**.
+Every request authenticates its own Bearer against the current registry, including
+on kept-alive connections. An HTTPS proxy may reuse one origin TCP connection for
+requests from several paired machines: each request selects its own machine,
+without binding the connection or its body framing to a machine identity.
+Connection admission tracks resource limits only; a successful authentication
+releases the connection's unauthenticated per-address slot and grants no authority
+to later requests.
 
 ### `POST <url>/v1/unpair`
 
@@ -97,6 +103,20 @@ workspace and native harness state required for independent recovery.
 ## Requests
 
 Push requests are `POST` with a JSON body and `Authorization: Bearer <token>`. `<url>` is the base URL passed to `semon pair URL CODE`. It must be `https`, except plain `http` to a loopback address (`localhost`, `[::1]`, 127.0.0.0/8).
+
+The receiver resolves push paths exactly before authentication: unknown endpoints,
+including trailing-slash or query-string variants, return **404** regardless of
+the Bearer. The known `/v1/push/append`, `/v1/push/facts` and `/v1/push/status`
+endpoints return **401** with `WWW-Authenticate: Bearer` for missing, unknown or
+revoked tokens, before method or body-framing checks. An authenticated request
+using another method receives **405** with `Allow: POST`. Bodies are read only
+after authentication, method, framing and size checks pass.
+
+Each receiver refusal emits one stderr record with a fixed endpoint label, HTTP
+status and reason class, for example
+`semon receive: refused endpoint=append status=401 reason=authentication`.
+Unrecognized or unparsed endpoints use `unknown`. These diagnostics never include
+raw URLs, Bearers, pairing codes, request bodies or response error text.
 
 Request bodies currently use identity encoding. Response gzip/Brotli and sealed
 storage are independent. See [native archive transport and codec measurements](native-archive-transport.md)

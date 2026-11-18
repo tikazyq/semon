@@ -8,8 +8,9 @@
 //! [`Limits::connections_per_ip`]; one more over either is closed as soon
 //! as it is accepted. Once authenticated, it counts only in the total, so
 //! several machines behind one address (an SSH tunnel, a NAT) each keep
-//! their connection. A request's token is checked, and its
-//! declared length against [`MAX_BODY_BYTES`], before any of its body is
+//! their connection. Connections retain no machine identity: a proxy may pool
+//! requests from several machines on one kept-alive connection. Each request's
+//! token is checked, and its declared length against [`MAX_BODY_BYTES`], before any of its body is
 //! read. Every read and write of the socket, runs against a deadline (see [`Limits`]), so a client that trickles bytes
 //! can't hold a connection past it. Semon never opens a port in a firewall
 //! or obtains a certificate.
@@ -28,7 +29,7 @@ use serde_json::{Value, json};
 
 #[path = "serve_auth.rs"]
 mod auth;
-use auth::{Authenticator, ConnectionAuthority};
+use auth::Authenticator;
 
 use crate::receiver::{DEFAULT_MAX_BYTES, Endpoint, MAX_BODY_BYTES, Receiver};
 
@@ -404,7 +405,7 @@ enum NoHead {
 struct Connection {
     stream: Timed,
     head_only: bool,
-    authority: ConnectionAuthority,
+    endpoint_label: &'static str,
     /// Bytes read and not yet used.
     buffer: Vec<u8>,
     limits: Limits,
@@ -503,6 +504,9 @@ impl Connection {
         close: bool,
         headers: &[(&str, &str)],
     ) -> io::Result<()> {
+        if status >= 400 {
+            eprintln!("{}", refusal_record(self.endpoint_label, status));
+        }
         let body = body.to_string();
         let mut out = format!(
             "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\n",
@@ -555,6 +559,37 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+// Never derive diagnostic fields from a URL, credential or response body.
+fn endpoint_label(target: &str) -> &'static str {
+    match target {
+        "/v1/pair" => "pair",
+        "/v1/unpair" => "unpair",
+        "/v1/push/append" => "append",
+        "/v1/push/facts" => "facts",
+        "/v1/push/status" => "status",
+        _ => "unknown",
+    }
+}
+
+fn refusal_record(endpoint: &str, status: u16) -> String {
+    let reason = match status {
+        400 | 431 | 505 => "invalid_request",
+        401 => "authentication",
+        403 => "pairing",
+        404 => "unknown_endpoint",
+        405 => "method",
+        408 => "timeout",
+        409 => "conflict",
+        411 => "framing",
+        413 => "body_limit",
+        417 => "expectation",
+        503 => "admission",
+        507 => "storage_limit",
+        _ => "storage",
+    };
+    format!("semon receive: refused endpoint={endpoint} status={status} reason={reason}")
 }
 
 fn reason(status: u16) -> &'static str {
@@ -703,12 +738,13 @@ fn serve_connection(slot: &mut Slot, socket: TcpStream, accepted: Instant) {
     let mut connection = Connection {
         stream: timed,
         head_only: false,
-        authority: ConnectionAuthority::default(),
+        endpoint_label: "unknown",
         buffer: Vec::new(),
         limits,
     };
     let mut first = Some(accepted);
     loop {
+        connection.endpoint_label = "unknown";
         let head = match connection.read_head(first.take()) {
             Ok(head) => head,
             Err(NoHead::Refused(status, message)) => {
@@ -721,6 +757,7 @@ fn serve_connection(slot: &mut Slot, socket: TcpStream, accepted: Instant) {
                 return connection.close();
             }
         };
+        connection.endpoint_label = endpoint_label(&head.target);
         if head.target != "/v1/pair"
             && head.target != "/v1/unpair"
             && !head.target.starts_with("/v1/push/")
@@ -839,11 +876,24 @@ fn answer_pair(shared: &Shared, slot: &mut Slot, connection: &mut Connection, he
     }
 }
 
-/// Checks a request in order (endpoint, method, framing, token, size) and,
+/// Checks a request in order (endpoint, token, method, framing, size) and,
 /// only once all pass, reads its body and answers it.
 fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &Head) -> Next {
     if head.target == "/v1/pair" || head.target == "/v1/unpair" {
         return answer_pair(shared, slot, connection, head);
+    }
+    let Some(endpoint) = Endpoint::from_path(&head.target) else {
+        return Next::Refuse(404, "unknown push endpoint", &[]);
+    };
+    let Some(machine) = shared
+        .tokens
+        .registry()
+        .authenticate(head.authorization.as_deref())
+    else {
+        return authority_refusal();
+    };
+    if head.method != "POST" {
+        return Next::Refuse(405, "the push protocol is POST only", &[("Allow", "POST")]);
     }
     if head.transfer_encoding {
         return Next::Refuse(
@@ -854,19 +904,6 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
     }
     if head.expect_other {
         return Next::Refuse(417, "only Expect: 100-continue is understood", &[]);
-    }
-    let Some(endpoint) = Endpoint::from_path(&head.target) else {
-        return authority_refusal();
-    };
-    let Some(machine) = shared
-        .tokens
-        .registry()
-        .authenticate(&mut connection.authority, head.authorization.as_deref())
-    else {
-        return authority_refusal();
-    };
-    if head.method != "POST" {
-        return Next::Refuse(405, "the push protocol is POST only", &[("Allow", "POST")]);
     }
     let Some(length) = head.content_length else {
         return Next::Refuse(411, "a Content-Length is required", &[]);
@@ -886,9 +923,6 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
         Err(_) => return Next::Close,
     };
     let reply = shared.receiver.handle(&machine, endpoint, &body);
-    if reply.status >= 500 {
-        eprintln!("semon receive: {machine}: {}", reply.body);
-    }
     match connection.respond(reply.status, &reply.body, head.close, &[]) {
         Ok(()) => Next::Continue,
         Err(_) => Next::Close,
@@ -940,6 +974,46 @@ mod tests {
         let many: String = (0..=MAX_HEADERS).map(|n| format!("X-{n}: 1\r\n")).collect();
         let many = format!("POST / HTTP/1.1\r\n{many}\r\n");
         assert_eq!(parse_head(many.as_bytes()).unwrap_err().0, 431);
+    }
+
+    #[test]
+    fn refusal_diagnostics_use_only_fixed_labels_and_reason_classes() {
+        for (target, label) in [
+            ("/v1/push/append", "append"),
+            ("/v1/push/facts", "facts"),
+            ("/v1/push/status", "status"),
+            ("/v1/pair", "pair"),
+            ("/v1/unpair", "unpair"),
+            ("/v1/push/append?token=private", "unknown"),
+            ("/v1/push/private-pair-code", "unknown"),
+        ] {
+            assert_eq!(endpoint_label(target), label);
+            assert_eq!(
+                refusal_record(endpoint_label(target), 401),
+                format!("semon receive: refused endpoint={label} status=401 reason=authentication")
+            );
+        }
+        for (status, reason) in [
+            (400, "invalid_request"),
+            (403, "pairing"),
+            (404, "unknown_endpoint"),
+            (405, "method"),
+            (408, "timeout"),
+            (409, "conflict"),
+            (411, "framing"),
+            (413, "body_limit"),
+            (417, "expectation"),
+            (431, "invalid_request"),
+            (500, "storage"),
+            (503, "admission"),
+            (505, "invalid_request"),
+            (507, "storage_limit"),
+        ] {
+            assert_eq!(
+                refusal_record("append", status),
+                format!("semon receive: refused endpoint=append status={status} reason={reason}")
+            );
+        }
     }
 
     #[test]

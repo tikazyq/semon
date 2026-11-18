@@ -294,6 +294,52 @@ fn unknown_and_revoked_tokens_are_401() {
 }
 
 #[test]
+fn push_routes_resolve_before_authentication_and_framing() {
+    let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
+    semon_push::simple_pair::unpair(&receiving.dir, "machine-6754a9c100000001", 1).unwrap();
+    for route in [
+        APPEND,
+        "/v1/push/facts",
+        "/v1/push/status",
+        "/v1/push/unknown",
+        "/v1/push/append?token=private",
+        "/v1/push/status/",
+    ] {
+        let known = [APPEND, "/v1/push/facts", "/v1/push/status"].contains(&route);
+        for token in [
+            None,
+            Some("unknown-token"),
+            Some(""),
+            Some(tokens[0].as_str()),
+        ] {
+            for method in ["POST", "HEAD", "GET"] {
+                for framing in [
+                    "Content-Length: 0\r\n",
+                    "Transfer-Encoding: chunked\r\n",
+                    "Expect: unsupported\r\n",
+                    "",
+                ] {
+                    let auth = token.map_or(String::new(), |token| {
+                        format!("Authorization: Bearer {token}\r\n")
+                    });
+                    let request = format!(
+                        "{method} {route} HTTP/1.1\r\nHost: {}\r\n{auth}{framing}Connection: close\r\n\r\n",
+                        receiving.address
+                    );
+                    let answer = exchange(receiving.address, request.as_bytes());
+                    assert_eq!(
+                        answer.status,
+                        if known { 401 } else { 404 },
+                        "{method} {route} {framing}"
+                    );
+                    assert_eq!(answer.head.contains("WWW-Authenticate: Bearer"), known);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn an_oversize_body_is_413_before_it_is_read() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     // Only the head is sent: the answer can't wait for the body.
@@ -320,7 +366,7 @@ fn an_oversize_body_is_413_before_it_is_read() {
 }
 
 #[test]
-fn only_post_to_the_two_endpoints() {
+fn only_post_to_known_push_endpoints() {
     let (receiving, tokens) = receiving(&["machine-6754a9c100000001"]);
     let answer = exchange(
         receiving.address,
@@ -339,15 +385,15 @@ fn only_post_to_the_two_endpoints() {
         "/v1/push/append?x=1",
         "/v1/frames",
     ] {
-        assert_eq!(
-            post(receiving.address, route, Some(&tokens[0]), b"{}").status,
-            401,
-            "{route}"
-        );
+        for token in [None, Some("unknown"), Some(tokens[0].as_str())] {
+            let answer = post(receiving.address, route, token, b"{}");
+            assert_eq!(answer.status, 404, "{route}");
+            assert!(!answer.head.contains("WWW-Authenticate"));
+        }
         let get = format!("GET {route} HTTP/1.1\r\n\r\n");
         assert_eq!(
             exchange(receiving.address, get.as_bytes()).status,
-            401,
+            404,
             "{route}"
         );
     }
@@ -591,26 +637,68 @@ fn a_post_without_a_length_is_411() {
 }
 
 #[test]
-fn registry_keep_alive_cannot_switch_machines() {
-    let (receiving, tokens) = receiving(&["machine-6754a9c100000001", "machine-6754a9c100000003"]);
+fn registry_keep_alive_authenticates_each_machines_appends_independently() {
+    let machines = ["machine-6754a9c100000001", "machine-6754a9c100000003"];
+    let (receiving, tokens) = receiving(&machines);
     let mut stream = TcpStream::connect(receiving.address).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
-    for (index, token) in tokens.iter().enumerate() {
-        let body = append_body(LOG, b"", 0, b"hello\n");
+    let mut stored = [Vec::new(), Vec::new()];
+    for (index, line) in [
+        (0, b"laptop one\n".as_slice()),
+        (1, b"desk one\n".as_slice()),
+        (0, b"laptop two\n".as_slice()),
+        (1, b"desk two\n".as_slice()),
+    ] {
+        let before = &stored[index];
+        let body = append_body(LOG, before, before.len() as u64, line);
         let head = format!(
-            "POST {APPEND} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+            "POST {APPEND} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+            tokens[index],
             body.len()
         );
         stream.write_all(head.as_bytes()).unwrap();
         stream.write_all(&body).unwrap();
         let answer = read_one(&mut stream);
+        assert_eq!(answer.status, 200, "machine {index}: {}", answer.body);
+        stored[index].extend_from_slice(line);
+        assert_eq!(answer.body["length"], stored[index].len());
+        // The same path belongs to two independent copies. Check both after
+        // every append, including the not-yet-created second copy.
+        for (machine, expected) in machines.iter().zip(&stored) {
+            let path = receiving
+                .dir
+                .join("machines")
+                .join(machine)
+                .join("claude")
+                .join(LOG);
+            if expected.is_empty() {
+                assert!(!path.exists());
+            } else {
+                assert_eq!(fs::read(path).unwrap(), *expected, "{machine}");
+            }
+        }
+    }
+    // A previously authenticated connection still rechecks revocation.
+    semon_push::simple_pair::unpair(&receiving.dir, machines[0], 1).unwrap();
+    let body = append_body(LOG, &stored[0], stored[0].len() as u64, b"refused\n");
+    stream
+        .write_all(&request(receiving.address, APPEND, Some(&tokens[0]), &body))
+        .unwrap();
+    assert_eq!(read_one(&mut stream).status, 401);
+    for (machine, expected) in machines.iter().zip(&stored) {
         assert_eq!(
-            answer.status,
-            if index == 0 { 200 } else { 401 },
-            "machine {index}: {}",
-            answer.body
+            fs::read(
+                receiving
+                    .dir
+                    .join("machines")
+                    .join(machine)
+                    .join("claude")
+                    .join(LOG)
+            )
+            .unwrap(),
+            *expected
         );
     }
 }
@@ -791,7 +879,7 @@ fn status_head_advertises_post_without_body_and_unknown_routes_stay_unsupported(
     assert!(answer.body.is_null());
     assert_eq!(answer.body_bytes, 0, "HEAD must not send an error body");
     let unknown = head.replace("/v1/push/status", "/v1/push/unknown-status");
-    assert_eq!(exchange(receiving.address, unknown.as_bytes()).status, 401);
+    assert_eq!(exchange(receiving.address, unknown.as_bytes()).status, 404);
     let unauthorized = post(
         receiving.address,
         "/v1/push/status",
