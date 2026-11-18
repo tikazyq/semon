@@ -662,32 +662,6 @@ const PUT_RUN: &str = "INSERT OR REPLACE INTO reported_runs (session_id, start, 
      api_duration, tool_duration, lines_added, lines_removed, model_usage, capture_at) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
 
-/// Read the index incarnation, the changes after `after` and, through `read`,
-/// derived rows from the same SQLite snapshot. A changed incarnation means
-/// the caller must re-read the namespace in full.
-pub(crate) fn read_silver_changes<T>(
-    connection: &mut Connection,
-    after: i64,
-    read: impl FnOnce(&Transaction<'_>, &str, &[(i64, String, String)]) -> rusqlite::Result<T>,
-) -> rusqlite::Result<T> {
-    let tx = connection.transaction()?;
-    let incarnation: String = tx.query_row(
-        "SELECT value FROM meta WHERE key='incarnation'",
-        [],
-        |row| row.get(0),
-    )?;
-    let changes = {
-        let mut statement =
-            tx.prepare("SELECT seq,session_key,kind FROM silver_change WHERE seq>?1 ORDER BY seq")?;
-        let rows =
-            statement.query_map([after], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let result = read(&tx, &incarnation, &changes)?;
-    tx.commit()?;
-    Ok(result)
-}
-
 /// The SQLite [`IndexStore`]: one connection, used by one
 /// [`super::EventCache`].
 struct SqliteStore {
@@ -10603,6 +10577,15 @@ mod tests {
         }
     }
 
+    fn silver_rows(
+        tx: &Transaction<'_>,
+        after: i64,
+    ) -> rusqlite::Result<Vec<(i64, String, String)>> {
+        tx.prepare("SELECT seq,session_key,kind FROM silver_change WHERE seq>?1 ORDER BY seq")?
+            .query_map([after], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect()
+    }
+
     #[test]
     fn unsupported_index_refusal_preserves_its_incarnation_and_change_log() {
         let root = scratch("incarnation");
@@ -10610,10 +10593,13 @@ mod tests {
         let path = cache.with_extension("sqlite3");
         let incarnation = |path: &Path| {
             let mut db = Connection::open(path).unwrap();
-            read_silver_changes(&mut db, 0, |_, incarnation, changes| {
-                assert!(changes.is_empty());
-                Ok(incarnation.to_owned())
-            })
+            let tx = db.transaction().unwrap();
+            assert!(silver_rows(&tx, 0).unwrap().is_empty());
+            tx.query_row(
+                "SELECT value FROM meta WHERE key='incarnation'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
             .unwrap()
         };
         let (old, _) = opened(&path);
@@ -10668,7 +10654,9 @@ mod tests {
             )
             .unwrap();
         let mut reader = Connection::open(&path).unwrap();
-        let (changes, count, later) = read_silver_changes(&mut reader, 1, |tx, _, changes| {
+        let (changes, count, later) = (|| -> rusqlite::Result<_> {
+            let tx = reader.transaction()?;
+            let changes = silver_rows(&tx, 1)?;
             writer
                 .execute(
                     "INSERT INTO silver_change(session_key,kind) VALUES('c','changed')",
@@ -10682,8 +10670,8 @@ mod tests {
                 [],
                 |row| row.get(0),
             )?;
-            Ok((changes.to_vec(), count, later))
-        })
+            Ok((changes, count, later))
+        })()
         .unwrap();
         assert_eq!(
             changes,
@@ -10693,8 +10681,7 @@ mod tests {
             ]
         );
         assert_eq!((count, later), (3, 0), "the closure sees the same snapshot");
-        let tail =
-            read_silver_changes(&mut reader, 3, |_, _, changes| Ok(changes.to_vec())).unwrap();
+        let tail = silver_rows(&reader.transaction().unwrap(), 3).unwrap();
         assert_eq!(tail, [(4, "c".to_owned(), "changed".to_owned())]);
         assert!(
             writer
@@ -10903,7 +10890,7 @@ mod tests {
         );
         let mut input = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
         let admitted = input
-            .read_admitted(None)
+            .read_admitted(None, Default::default())
             .unwrap()
             .changes
             .into_iter()
@@ -10955,6 +10942,243 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn analytics_budget(sessions: u32, steps: u64) -> semon_asi::input::ReadBudget {
+        semon_asi::input::ReadBudget {
+            sessions: sessions.try_into().unwrap(),
+            steps,
+        }
+    }
+
+    #[test]
+    fn chunked_analytics_matches_a_single_read_and_bounds_incremental_work() {
+        let root = scratch("analytics-budget");
+        let (options, mut rows, slots) = catalog_native_fixture(&root, 4, false);
+        let path = super::super::EventCache::path(&options.cache);
+        let (mut store, _) = opened(&path);
+        rows.iter_mut()
+            .find(|row| row.key == "native-cl-02")
+            .unwrap()
+            .session_activity = None;
+        catalog_write(&mut store, &rows, &slots, false, CatalogWriter::Auto).unwrap();
+        let mut input = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
+        let one = input
+            .read_admitted(None, analytics_budget(100, u64::MAX))
+            .unwrap();
+        assert!(!one.more);
+        for (sessions, steps) in [(1, 100), (2, 1), (100, 0)] {
+            let budget = analytics_budget(sessions, steps);
+            let mut checkpoint = None;
+            let mut changes = Vec::new();
+            let mut chunks = 0;
+            loop {
+                let page = input.read_admitted(checkpoint.as_deref(), budget).unwrap();
+                assert_analytics_chunk_budget(&page.changes, sessions, steps);
+                changes.extend(page.changes);
+                chunks += 1;
+                if !page.more {
+                    assert_eq!(page.reconciliation, one.reconciliation);
+                    assert_eq!(page.checkpoint, one.checkpoint);
+                    break;
+                }
+                assert_eq!(page.reconciliation, Reconciliation::InventoryPartial);
+                assert!(chunks < 10);
+                checkpoint = Some(page.checkpoint);
+            }
+            assert!(chunks > 1);
+            assert_eq!(changes, one.changes);
+        }
+
+        for row in &rows {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO silver_change(session_key,kind) VALUES(?1,'changed')",
+                    [&row.key],
+                )
+                .unwrap();
+        }
+        let mut checkpoint = one.checkpoint;
+        for page_number in 1..=rows.len() {
+            let page = input
+                .read_admitted(Some(&checkpoint), analytics_budget(1, 0))
+                .unwrap();
+            assert_eq!(page.reconciliation, Reconciliation::Incremental);
+            assert_analytics_chunk_budget(&page.changes, 1, 0);
+            assert_eq!(page.more, page_number < rows.len());
+            assert_ne!(page.checkpoint, checkpoint);
+            checkpoint = page.checkpoint;
+        }
+        drop(input);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_analytics_chunk_budget(changes: &[SessionChange], sessions: u32, steps: u64) {
+        let session_count = changes
+            .iter()
+            .filter(|change| !matches!(change, SessionChange::SourceRestored { .. }))
+            .count();
+        let step_count = changes
+            .iter()
+            .filter_map(|change| match change {
+                SessionChange::Admitted(session) => Some(session.steps.len() as u64),
+                _ => None,
+            })
+            .sum::<u64>();
+        assert!((1..=sessions as usize).contains(&session_count));
+        assert!(step_count <= steps || session_count == 1);
+    }
+
+    #[test]
+    fn inventory_replays_additions_removals_and_changes_behind_the_cursor() {
+        use semon_asi::input::AdmittedSession;
+        use std::io::Write;
+
+        let root = scratch("analytics-inventory-replay");
+        let (options, rows, slots) = catalog_native_fixture(&root, 4, false);
+        let path = super::super::EventCache::path(&options.cache);
+        let (mut store, _) = opened(&path);
+        // Start without the first Claude session, so adding it later places it
+        // behind the cursor. Read the remaining Claude row and one Codex row.
+        let added = rows.iter().find(|row| row.key == "native-cl-00").unwrap();
+        let initial: Vec<_> = rows
+            .iter()
+            .filter(|row| row.key != added.key)
+            .cloned()
+            .collect();
+        catalog_write(&mut store, &initial, &slots, false, CatalogWriter::Auto).unwrap();
+        let mut reader = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
+        let budget = analytics_budget(2, 100);
+        let first = reader.read_admitted(None, budget).unwrap();
+        assert!(first.more);
+        let mut live = BTreeMap::<String, Box<AdmittedSession>>::new();
+        let apply = |live: &mut BTreeMap<_, _>, changes: Vec<SessionChange>| {
+            for change in changes {
+                match change {
+                    SessionChange::Admitted(session) => {
+                        live.insert(session.session_uid.clone(), session);
+                    }
+                    SessionChange::Removed { session_uid } => {
+                        assert!(live.remove(&session_uid).is_some());
+                    }
+                    SessionChange::SourceMissing { .. } => {
+                        panic!("premature source-missing observation")
+                    }
+                    _ => {}
+                }
+            }
+        };
+        apply(&mut live, first.changes);
+        drop(reader);
+        let changed = initial
+            .iter()
+            .find(|row| row.key == "native-cl-02")
+            .unwrap();
+        let changed_uid = "fixture-machine/claude/native-cl-02";
+        let old_steps = live[changed_uid].steps.len();
+        let mut source = fs::OpenOptions::new()
+            .append(true)
+            .open(&changed.sources[0].path)
+            .unwrap();
+        writeln!(source, "{}", serde_json::json!({
+            "type":"assistant","uuid":"new-answer","sessionId":"native-cl-02",
+            "timestamp":"2026-09-24T00:02:00Z","message":{"id":"new-msg",
+            "role":"assistant","model":"claude-sonnet-4-5",
+            "content":[{"type":"text","text":"Second answer"}],"usage":{"input_tokens":17,"output_tokens":6}}
+        })).unwrap();
+        drop(source);
+        let (rows, slots) = catalog_fixture_projection(&options);
+        catalog_write(&mut store, &rows, &slots, false, CatalogWriter::Auto).unwrap();
+        let dropped = rows
+            .iter()
+            .find(|row| row.native_ids[0] == "native-cx-01")
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        tx.execute(
+            "DELETE FROM session_catalog WHERE session_key=?1",
+            [&dropped.key],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM session_activity_projections WHERE session_key=?1",
+            [&dropped.key],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO silver_change(session_key,kind) VALUES(?1,'removed')",
+            [&dropped.key],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut reader = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
+        let mut checkpoint = first.checkpoint;
+        let complete = loop {
+            let page = reader.read_admitted(Some(&checkpoint), budget).unwrap();
+            apply(&mut live, page.changes);
+            if !page.more {
+                break page.reconciliation;
+            }
+            assert_eq!(page.reconciliation, Reconciliation::InventoryPartial);
+            assert_ne!(page.checkpoint, checkpoint);
+            checkpoint = page.checkpoint;
+        };
+        let one = reader
+            .read_admitted(None, analytics_budget(100, u64::MAX))
+            .unwrap();
+        let mut expected = BTreeMap::new();
+        apply(&mut expected, one.changes);
+        assert_eq!(live, expected);
+        assert_eq!(complete, one.reconciliation);
+        assert!(live.contains_key("fixture-machine/claude/native-cl-00"));
+        assert!(live[changed_uid].steps.len() > old_steps);
+        assert!(!live.contains_key("fixture-machine/codex/native-cx-01"));
+        drop(reader);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inventory_refuses_tampered_progress_and_restarts_after_incarnation_change() {
+        let root = scratch("analytics-inventory-checkpoint");
+        let (options, rows, slots) = catalog_native_fixture(&root, 4, false);
+        let path = super::super::EventCache::path(&options.cache);
+        let (mut store, _) = opened(&path);
+        catalog_write(&mut store, &rows, &slots, false, CatalogWriter::Auto).unwrap();
+        let mut input = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
+        let budget = analytics_budget(1, 100);
+        let first = input.read_admitted(None, budget).unwrap();
+        assert!(first.more);
+        let forged = first.checkpoint.replace("native-cl-00", "native-cl-02");
+        assert_ne!(first.checkpoint, forged);
+        assert!(matches!(
+            input.read_admitted(Some(&forged), budget),
+            Err(rusqlite::Error::InvalidQuery)
+        ));
+        assert!(matches!(
+            input.read_admitted(Some("bad checkpoint"), budget),
+            Err(rusqlite::Error::InvalidQuery)
+        ));
+
+        store
+            .connection
+            .execute(
+                "UPDATE meta SET value=lower(hex(randomblob(16))) WHERE key='incarnation'",
+                [],
+            )
+            .unwrap();
+        let restarted = input
+            .read_admitted(Some(&first.checkpoint), budget)
+            .unwrap();
+        assert!(restarted.more);
+        assert_eq!(restarted.reconciliation, Reconciliation::InventoryPartial);
+        assert_eq!(restarted.changes, first.changes);
+        assert_ne!(restarted.checkpoint, first.checkpoint);
+        drop(input);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn analytics_input_reads_real_catalog_generations_and_explicit_removals() {
         use std::io::Write;
@@ -10983,8 +11207,11 @@ mod tests {
         );
 
         let mut input = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
-        let initial = input.read_admitted(None).unwrap();
-        assert_eq!(initial.reconciliation, Reconciliation::ReplaceNamespace);
+        let initial = input.read_admitted(None, Default::default()).unwrap();
+        assert!(matches!(
+            initial.reconciliation,
+            Reconciliation::InventoryComplete { .. }
+        ));
         let pending_uid = format!("fixture-machine/claude/{pending_native_id}");
         assert_eq!(
             initial
@@ -11037,7 +11264,9 @@ mod tests {
                 .0,
             Outcome::Written
         );
-        let admitted = input.read_admitted(Some(&initial.checkpoint)).unwrap();
+        let admitted = input
+            .read_admitted(Some(&initial.checkpoint), Default::default())
+            .unwrap();
         assert_eq!(admitted.reconciliation, Reconciliation::Incremental);
         assert!(admitted.changes.iter().any(|change| {
             matches!(change, SessionChange::SourceRestored { session_uid } if session_uid == &pending_uid)
@@ -11106,12 +11335,14 @@ mod tests {
             retained,
             "Pending retains the complete activity generation and facts"
         );
-        let pending = input.read_admitted(Some(&admitted.checkpoint)).unwrap();
+        let pending = input
+            .read_admitted(Some(&admitted.checkpoint), Default::default())
+            .unwrap();
         assert!(pending.changes.iter().any(|change| {
             matches!(change, SessionChange::Pending { session_uid } if session_uid == source_only_uid)
         }));
         let mut full = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
-        let full_pending = full.read_admitted(None).unwrap();
+        let full_pending = full.read_admitted(None, Default::default()).unwrap();
         assert!(full_pending.changes.iter().any(|change| {
             matches!(change, SessionChange::Pending { session_uid } if session_uid == source_only_uid)
         }));
@@ -11121,7 +11352,9 @@ mod tests {
                 .0,
             Outcome::Written
         );
-        let restored = input.read_admitted(Some(&pending.checkpoint)).unwrap();
+        let restored = input
+            .read_admitted(Some(&pending.checkpoint), Default::default())
+            .unwrap();
         assert!(restored.changes.iter().any(|change| {
             matches!(change, SessionChange::SourceRestored { session_uid } if session_uid == source_only_uid)
         }));
@@ -11131,7 +11364,7 @@ mod tests {
         let restored_session = restored.changes.iter().find(|change| {
             matches!(change, SessionChange::Admitted(session) if session.session_uid == source_only_uid)
         }).unwrap();
-        let full_restored = full.read_admitted(None).unwrap();
+        let full_restored = full.read_admitted(None, Default::default()).unwrap();
         assert!(
             full_restored.changes.contains(restored_session),
             "incremental and full restoration admit the same complete generation"
@@ -11150,7 +11383,9 @@ mod tests {
                 [&live_removed_key],
             )
             .unwrap();
-        let invalidated = input.read_admitted(Some(&admitted.checkpoint)).unwrap();
+        let invalidated = input
+            .read_admitted(Some(&admitted.checkpoint), Default::default())
+            .unwrap();
         assert!(invalidated.changes.iter().any(|change| {
             matches!(change, SessionChange::Pending { session_uid } if session_uid == &pending_uid)
         }));
@@ -11179,7 +11414,9 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-        let removed = input.read_admitted(Some(&invalidated.checkpoint)).unwrap();
+        let removed = input
+            .read_admitted(Some(&invalidated.checkpoint), Default::default())
+            .unwrap();
         assert!(removed.changes.iter().any(|change| {
             matches!(change, SessionChange::Removed { session_uid } if session_uid == removed_uid)
         }));
@@ -11199,10 +11436,13 @@ mod tests {
         let mut replacement = SqliteAnalyticsInput::open(&path, "fixture-machine").unwrap();
         assert_eq!(
             replacement
-                .read_admitted(Some(&checkpoint))
+                .read_admitted(Some(&checkpoint), Default::default())
                 .unwrap()
                 .reconciliation,
-            Reconciliation::ReplaceNamespace
+            Reconciliation::InventoryComplete {
+                session_uids: BTreeSet::new(),
+                source_missing: BTreeSet::new(),
+            }
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -5,7 +5,10 @@
 //! return one coherent read snapshot: a change and the session evidence it
 //! names can never come from different SQLite snapshots.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
+};
 
 /// Version of the pure ASI projection. It is independent of the native Event
 /// Index parser/cache version.
@@ -31,38 +34,59 @@ pub fn encode_component(value: &str) -> String {
     encoded
 }
 
-/// Reads one namespace of admitted activity evidence.
-///
-/// `checkpoint` is deliberately opaque to `semon-asi`.  An implementation
-/// encodes its index incarnation and sequence there; when its incarnation
-/// changes it returns a full namespace batch instead of interpreting a prior
-/// sequence in the new index.
+/// Maximum sessions and steps to read together. A session exceeding the step
+/// budget occupies a chunk of its own.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadBudget {
+    pub sessions: NonZeroU32,
+    pub steps: u64,
+}
+
+impl Default for ReadBudget {
+    fn default() -> Self {
+        Self {
+            sessions: NonZeroU32::new(64).unwrap(),
+            steps: 4096,
+        }
+    }
+}
+
+/// Reads one namespace of admitted activity evidence. The input owns the
+/// opaque checkpoint, including any cursor needed to resume a partial inventory.
 pub trait AnalyticsInput {
     type Error;
 
-    fn read_admitted(&mut self, checkpoint: Option<&str>) -> Result<AdmittedBatch, Self::Error>;
+    fn read_admitted(
+        &mut self,
+        checkpoint: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<AdmittedBatch, Self::Error>;
 }
 
-/// A coherent incremental input read for one namespace.
+/// One coherent input chunk for a namespace.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdmittedBatch {
     pub namespace: String,
-    /// Implementation-defined incarnation and sequence checkpoint.
+    /// Passed back on the next read, including after a writer restart.
     pub checkpoint: String,
-    /// A new index incarnation replaces the complete namespace inventory.
-    /// Consumers must reconcile absent prior sessions by marking their retained
-    /// rows source-missing rather than treating the batch as another incremental
-    /// patch.
+    /// True if there is more work in this cycle.
+    pub more: bool,
     pub reconciliation: Reconciliation,
-    /// Changed sessions, explicit removals, and availability observations in
-    /// sequence order.  An admitted session with no steps is still `Admitted`.
+    /// Whole-session changes and availability observations. An admitted session
+    /// with no steps is still `Admitted`.
     pub changes: Vec<SessionChange>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reconciliation {
     Incremental,
-    ReplaceNamespace,
+    InventoryPartial,
+    InventoryComplete {
+        /// Includes pending identities, even if they were seen in earlier chunks.
+        session_uids: BTreeSet<String>,
+        /// Inventory members whose last admitted source cohort is unavailable.
+        source_missing: BTreeSet<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

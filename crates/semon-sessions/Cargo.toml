@@ -11,6 +11,7 @@ semon-asi = { path = "../semon-asi" }
 getrandom.workspace = true
 libc.workspace = true
 reqwest.workspace = true
+ring = "0.17.14"
 rusqlite = { workspace = true, features = ["cache", "hooks", "limits"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json.workspace = true

@@ -1946,6 +1946,7 @@ dependencies = [
  "libc",
  "parquet",
  "reqwest",
+ "ring 0.17.14",
  "rusqlite",
  "semon-asi",
  "serde",

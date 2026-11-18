@@ -1,4 +1,4 @@
-//! One atomic origin publication cycle.
+//! Atomic publication of one origin input chunk.
 //!
 //! The input has already admitted and priced a complete session generation. This
 //! module only projects that evidence, retains frozen rows, and hands one
@@ -13,7 +13,10 @@ use arrow::array::{
 use arrow::record_batch::RecordBatch;
 
 use crate::error::Error;
-use crate::input::{ANALYTICS_TRANSFORM_VERSION, AnalyticsInput, SessionChange, encode_component};
+use crate::input::{
+    ANALYTICS_TRANSFORM_VERSION, AnalyticsInput, ReadBudget, Reconciliation, SessionChange,
+    encode_component,
+};
 use crate::parquet_io::read_batches;
 use crate::projection::{Cell, Row, project};
 use crate::schema::{Kind, TABLES, Table, Type};
@@ -44,19 +47,25 @@ impl<E: std::error::Error + 'static> std::error::Error for PublishError<E> {
     }
 }
 
-/// Publishes one coherent input batch as one store generation.
+/// The visible generation and whether the cycle needs another chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedChunk {
+    pub generation: u64,
+    pub more: bool,
+}
+
+/// Publishes one coherent input chunk as one store generation.
 ///
 /// `versions` are the writer's current targets. They are manifest metadata,
 /// not a claim that every retained session has those recorded versions. The
-/// transform target is always the current pure projection version. A
-/// `ReplaceNamespace` batch marks prior live sessions absent from its complete
-/// namespace inventory source-missing; it retains their facts.
+/// transform target is always the current pure projection version. Only the
+/// final inventory chunk reconciles prior live sessions against the inventory.
 pub fn publish_cycle<C: Clock, I: AnalyticsInput>(
     store: &mut Store<C>,
     input: &mut I,
     namespace: &str,
     mut versions: Versions,
-) -> std::result::Result<u64, PublishError<I::Error>> {
+) -> std::result::Result<PublishedChunk, PublishError<I::Error>> {
     versions.transform = ANALYTICS_TRANSFORM_VERSION;
     let checkpoint = store
         .manifest()
@@ -64,16 +73,18 @@ pub fn publish_cycle<C: Clock, I: AnalyticsInput>(
         .get(namespace)
         .map(String::as_str);
     let batch = input
-        .read_admitted(checkpoint)
+        .read_admitted(checkpoint, ReadBudget::default())
         .map_err(PublishError::Input)?;
     if batch.namespace != namespace {
         return Err(PublishError::Store(Error::invalid(
             "input returned a batch for another namespace",
         )));
     }
-    update_for_batch(store, batch, versions)
+    let more = batch.more;
+    let generation = update_for_batch(store, batch, versions)
         .and_then(|update| store.publish(&update))
-        .map_err(PublishError::Store)
+        .map_err(PublishError::Store)?;
+    Ok(PublishedChunk { generation, more })
 }
 
 fn update_for_batch<C: Clock>(
@@ -87,15 +98,12 @@ fn update_for_batch<C: Clock>(
     let mut removed = BTreeSet::new();
     let mut source_missing = BTreeMap::new();
     let mut source_restored = BTreeSet::new();
-    let mut mentioned = BTreeSet::new();
     let mut currently_missing = store.manifest().source_missing.keys().cloned().collect();
 
-    // ReplaceNamespace is a complete input inventory, but only an explicit
-    // Removed change authorizes dropping already-published facts.
+    // Only an explicit removal authorizes dropping already-published facts.
     for change in batch.changes {
         match change {
             SessionChange::Admitted(session) => {
-                mentioned.insert(session.session_uid.clone());
                 if !touched.insert(session.session_uid.clone()) {
                     return Err(Error::invalid("input admits a session more than once"));
                 }
@@ -111,14 +119,16 @@ fn update_for_batch<C: Clock>(
                     }
                 }
             }
-            SessionChange::Pending { session_uid } => {
-                mentioned.insert(session_uid);
-            }
+            SessionChange::Pending { .. } => {}
             SessionChange::SourceMissing {
                 session_uid,
                 retained_at_origin: _,
             } => {
-                mentioned.insert(session_uid.clone());
+                if batch.reconciliation == Reconciliation::InventoryPartial {
+                    return Err(Error::invalid(
+                        "source-missing observation in a partial inventory",
+                    ));
+                }
                 mark_source_missing(
                     store,
                     &session_uid,
@@ -128,13 +138,11 @@ fn update_for_batch<C: Clock>(
                 );
             }
             SessionChange::SourceRestored { session_uid } => {
-                mentioned.insert(session_uid.clone());
                 currently_missing.remove(&session_uid);
                 source_missing.remove(&session_uid);
                 source_restored.insert(session_uid);
             }
             SessionChange::Removed { session_uid } => {
-                mentioned.insert(session_uid.clone());
                 removed.insert(session_uid);
             }
         }
@@ -148,10 +156,17 @@ fn update_for_batch<C: Clock>(
         source_restored.remove(session);
     }
 
-    if batch.reconciliation == crate::input::Reconciliation::ReplaceNamespace {
+    if let Reconciliation::InventoryComplete {
+        session_uids,
+        source_missing: unavailable,
+    } = batch.reconciliation
+    {
         let namespace_prefix = format!("{}/", encode_component(&batch.namespace));
         for session_uid in store.live_map().keys() {
-            if session_uid.starts_with(&namespace_prefix) && !mentioned.contains(session_uid) {
+            if session_uid.starts_with(&namespace_prefix)
+                && !removed.contains(session_uid)
+                && (!session_uids.contains(session_uid) || unavailable.contains(session_uid))
+            {
                 mark_source_missing(
                     store,
                     session_uid,
@@ -507,8 +522,8 @@ mod tests {
     use super::*;
     use crate::input::{
         AdmittedBatch, AdmittedSession, BillingUsage, ContextBand, Coverage, Model, ParentMethod,
-        Price, PriceUnit, RateKind, Reconciliation, RecordedCost, RecordedVersions, Repo, Role,
-        Session, SourceWitness, Status, Step, ToolCall, UNKNOWN_REPO_KEY, UsageOwner,
+        Price, PriceUnit, RateKind, RecordedCost, RecordedVersions, Repo, Role, Session,
+        SourceWitness, Status, Step, ToolCall, UNKNOWN_REPO_KEY, UsageOwner,
     };
     use crate::schema::{
         DIM_PRICE, DIM_REPO, DIM_TOOL, FACT_SESSION, FACT_STEP, FACT_TOOL_CALL, Kind,
@@ -538,6 +553,7 @@ mod tests {
         fn read_admitted(
             &mut self,
             checkpoint: Option<&str>,
+            _budget: ReadBudget,
         ) -> std::result::Result<AdmittedBatch, Self::Error> {
             self.checkpoints.push(checkpoint.map(str::to_owned));
             Ok(self.batches.pop_front().expect("queued batch"))
@@ -552,15 +568,33 @@ mod tests {
         }
     }
 
-    fn batch(
-        checkpoint: &str,
-        reconciliation: Reconciliation,
-        changes: Vec<SessionChange>,
-    ) -> AdmittedBatch {
+    enum Scope {
+        Incremental,
+        Inventory,
+    }
+
+    fn batch(checkpoint: &str, scope: Scope, changes: Vec<SessionChange>) -> AdmittedBatch {
         AdmittedBatch {
             namespace: NAMESPACE.into(),
             checkpoint: checkpoint.into(),
-            reconciliation,
+            more: false,
+            reconciliation: match scope {
+                Scope::Incremental => Reconciliation::Incremental,
+                Scope::Inventory => Reconciliation::InventoryComplete {
+                    session_uids: changes
+                        .iter()
+                        .map(|change| match change {
+                            SessionChange::Admitted(session) => &session.session_uid,
+                            SessionChange::Pending { session_uid }
+                            | SessionChange::SourceMissing { session_uid, .. }
+                            | SessionChange::SourceRestored { session_uid }
+                            | SessionChange::Removed { session_uid } => session_uid,
+                        })
+                        .cloned()
+                        .collect(),
+                    source_missing: BTreeSet::new(),
+                },
+            },
             changes,
         }
     }
@@ -702,7 +736,7 @@ mod tests {
             |(index, observations)| {
                 batch(
                     &format!("inc:{index}"),
-                    Reconciliation::Incremental,
+                    Scope::Incremental,
                     observations
                         .iter()
                         .cloned()
@@ -737,7 +771,7 @@ mod tests {
         let mut store = open(dir.path());
         let mut input = QueuedInput::new([batch(
             "inc:1",
-            Reconciliation::ReplaceNamespace,
+            Scope::Inventory,
             vec![
                 SessionChange::Admitted(Box::new(session("one", Some("old"), "shell"))),
                 SessionChange::Admitted(Box::new(session("empty", None, "unused"))),
@@ -745,7 +779,9 @@ mod tests {
         )]);
 
         assert_eq!(
-            publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap(),
+            publish_cycle(&mut store, &mut input, NAMESPACE, versions())
+                .unwrap()
+                .generation,
             1
         );
         assert_eq!(input.checkpoints, vec![None]);
@@ -767,17 +803,17 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(first))],
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::Admitted(Box::new(changed))],
             ),
             batch(
                 "inc:3",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::Pending {
                     session_uid: "m/codex/one".into(),
                 }],
@@ -805,7 +841,7 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("s"),
@@ -814,7 +850,7 @@ mod tests {
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::SourceMissing {
                     session_uid: "m/codex/one".into(),
                     retained_at_origin: true,
@@ -822,14 +858,14 @@ mod tests {
             ),
             batch(
                 "inc:3",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::SourceRestored {
                     session_uid: "m/codex/one".into(),
                 }],
             ),
             batch(
                 "inc:4",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::Removed {
                     session_uid: "m/codex/one".into(),
                 }],
@@ -857,7 +893,7 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("step"),
@@ -866,7 +902,7 @@ mod tests {
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::SourceMissing {
                     session_uid: "m/codex/one".into(),
                     retained_at_origin: true,
@@ -874,7 +910,7 @@ mod tests {
             ),
             batch(
                 "inc:3",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::SourceMissing {
                     session_uid: "m/codex/one".into(),
                     retained_at_origin: true,
@@ -882,14 +918,14 @@ mod tests {
             ),
             batch(
                 "inc:4",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::SourceRestored {
                     session_uid: "m/codex/one".into(),
                 }],
             ),
             batch(
                 "inc:5",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::SourceMissing {
                     session_uid: "m/codex/one".into(),
                     retained_at_origin: true,
@@ -934,7 +970,7 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "old:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![
                     SessionChange::Admitted(Box::new(session("one", Some("old"), "shell"))),
                     SessionChange::Admitted(Box::new(session("frozen", Some("frozen"), "git"))),
@@ -942,7 +978,7 @@ mod tests {
             ),
             batch(
                 "new:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("new"),
@@ -951,7 +987,7 @@ mod tests {
             ),
             batch(
                 "new:2",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("newer"),
@@ -960,7 +996,7 @@ mod tests {
             ),
             batch(
                 "inc:3",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![
                     SessionChange::SourceRestored {
                         session_uid: "m/codex/frozen".into(),
@@ -1006,6 +1042,112 @@ mod tests {
     }
 
     #[test]
+    fn inventory_resumes_from_manifest_and_reconciles_missing_only_at_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::new(100);
+        let mut store = Store::open_with_clock(dir.path(), clock.clone()).unwrap();
+        let changes = ["early", "late", "removed", "absent", "unavailable"]
+            .into_iter()
+            .map(|id| SessionChange::Admitted(Box::new(session(id, Some("old"), "shell"))))
+            .collect();
+        let mut input = QueuedInput::new([batch("old", Scope::Inventory, changes)]);
+        assert_eq!(
+            publish_cycle(&mut store, &mut input, NAMESPACE, versions())
+                .unwrap()
+                .generation,
+            1
+        );
+        let original = store.live_map().clone();
+
+        let mut partial = QueuedInput::new([AdmittedBatch {
+            namespace: NAMESPACE.into(),
+            checkpoint: "inventory-cursor".into(),
+            more: true,
+            reconciliation: Reconciliation::InventoryPartial,
+            changes: vec![
+                SessionChange::Admitted(Box::new(session("early", Some("new"), "git"))),
+                SessionChange::Removed {
+                    session_uid: "m/codex/removed".into(),
+                },
+            ],
+        }]);
+        let chunk = publish_cycle(&mut store, &mut partial, NAMESPACE, versions()).unwrap();
+        assert_eq!(
+            chunk,
+            PublishedChunk {
+                generation: 2,
+                more: true
+            }
+        );
+        assert!(store.manifest().source_missing.is_empty());
+        assert_eq!(store.live_map()["m/codex/late"], original["m/codex/late"]);
+        assert!(!store.live_map().contains_key("m/codex/removed"));
+        drop(store);
+
+        clock.advance(100);
+        let mut store = Store::open_with_clock(dir.path(), clock.clone()).unwrap();
+        assert!(store.manifest().source_missing.is_empty());
+        let complete = AdmittedBatch {
+            namespace: NAMESPACE.into(),
+            checkpoint: "done".into(),
+            more: false,
+            reconciliation: Reconciliation::InventoryComplete {
+                session_uids: [
+                    "m/codex/early".into(),
+                    "m/codex/late".into(),
+                    "m/codex/unavailable".into(),
+                ]
+                .into(),
+                source_missing: ["m/codex/unavailable".into()].into(),
+            },
+            changes: vec![SessionChange::Pending {
+                session_uid: "m/codex/late".into(),
+            }],
+        };
+        let mut input = QueuedInput::new([complete.clone(), complete]);
+        let chunk = publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
+        assert_eq!(
+            chunk,
+            PublishedChunk {
+                generation: 3,
+                more: false
+            }
+        );
+        assert_eq!(input.checkpoints[0].as_deref(), Some("inventory-cursor"));
+        assert_eq!(
+            store.live_map()["m/codex/absent"],
+            original["m/codex/absent"]
+        );
+        assert_eq!(
+            store
+                .manifest()
+                .source_missing
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["m/codex/absent", "m/codex/unavailable"]
+        );
+        assert!(
+            store
+                .manifest()
+                .source_missing
+                .values()
+                .all(|marker| marker.detected_at == 200)
+        );
+
+        clock.advance(100);
+        publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
+        assert!(
+            store
+                .manifest()
+                .source_missing
+                .values()
+                .all(|marker| marker.detected_at == 200)
+        );
+        assert!(!store.live_map().contains_key("m/codex/removed"));
+    }
+
+    #[test]
     fn replace_namespace_matches_only_its_encoded_component() {
         let namespaces = ["a/b", "a%2Fb", "a", "a b", "机器"];
         let uids: Vec<_> = namespaces
@@ -1026,7 +1168,11 @@ mod tests {
             let mut input = QueuedInput::new([AdmittedBatch {
                 namespace: namespace.into(),
                 checkpoint: "new:1".into(),
-                reconciliation: Reconciliation::ReplaceNamespace,
+                more: false,
+                reconciliation: Reconciliation::InventoryComplete {
+                    session_uids: [format!("{prefix}/codex/present")].into(),
+                    source_missing: BTreeSet::new(),
+                },
                 changes: vec![SessionChange::Pending {
                     session_uid: format!("{prefix}/codex/present"),
                 }],
@@ -1058,15 +1204,11 @@ mod tests {
             let two = SessionChange::Admitted(Box::new(unknown_repo_session("two", "/work/two")));
             let batches = if separate_cycles {
                 vec![
-                    batch("inc:1", Reconciliation::ReplaceNamespace, vec![one]),
-                    batch("inc:2", Reconciliation::Incremental, vec![two]),
+                    batch("inc:1", Scope::Inventory, vec![one]),
+                    batch("inc:2", Scope::Incremental, vec![two]),
                 ]
             } else {
-                vec![batch(
-                    "inc:1",
-                    Reconciliation::ReplaceNamespace,
-                    vec![one, two],
-                )]
+                vec![batch("inc:1", Scope::Inventory, vec![one, two])]
             };
             let mut input = QueuedInput::new(batches);
             publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
@@ -1114,19 +1256,11 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(index, change)| {
-                        batch(
-                            &format!("inc:{index}"),
-                            Reconciliation::Incremental,
-                            vec![change],
-                        )
+                        batch(&format!("inc:{index}"), Scope::Incremental, vec![change])
                     })
                     .collect()
             } else {
-                vec![batch(
-                    "inc:1",
-                    Reconciliation::ReplaceNamespace,
-                    changes.into(),
-                )]
+                vec![batch("inc:1", Scope::Inventory, changes.into())]
             };
             let mut input = QueuedInput::new(batches);
             publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
@@ -1178,15 +1312,11 @@ mod tests {
                         .into_iter()
                         .enumerate()
                         .map(|(index, change)| {
-                            batch(
-                                &format!("inc:{index}"),
-                                Reconciliation::Incremental,
-                                vec![change],
-                            )
+                            batch(&format!("inc:{index}"), Scope::Incremental, vec![change])
                         })
                         .collect()
                 } else {
-                    vec![batch("inc:1", Reconciliation::ReplaceNamespace, changes)]
+                    vec![batch("inc:1", Scope::Inventory, changes)]
                 };
                 let mut input = QueuedInput::new(batches);
                 publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
@@ -1217,7 +1347,7 @@ mod tests {
             let mut store = open(dir.path());
             let mut seed = QueuedInput::new([batch(
                 "seed:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "seed", None, "shell",
                 )))],
@@ -1227,11 +1357,11 @@ mod tests {
             let two = SessionChange::Admitted(Box::new(priced_session("two", 200, 2.0)));
             let batches = if separate_cycles {
                 vec![
-                    batch("inc:1", Reconciliation::Incremental, vec![one]),
-                    batch("inc:2", Reconciliation::Incremental, vec![two]),
+                    batch("inc:1", Scope::Incremental, vec![one]),
+                    batch("inc:2", Scope::Incremental, vec![two]),
                 ]
             } else {
-                vec![batch("inc:1", Reconciliation::Incremental, vec![one, two])]
+                vec![batch("inc:1", Scope::Incremental, vec![one, two])]
             };
             let mut input = QueuedInput::new(batches);
             if separate_cycles {
@@ -1389,12 +1519,12 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(admitted.clone()))],
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::Admitted(Box::new(admitted))],
             ),
         ]);
@@ -1425,7 +1555,7 @@ mod tests {
         let mut store = open(dir.path());
         let mut input = QueuedInput::new([batch(
             "inc:1",
-            Reconciliation::ReplaceNamespace,
+            Scope::Inventory,
             vec![
                 SessionChange::Admitted(Box::new(remote_session("one", "/work/one"))),
                 SessionChange::Admitted(Box::new(remote_session("two", "/work/two"))),
@@ -1445,7 +1575,7 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(remote_session(
                     "one",
                     "/work/one",
@@ -1453,7 +1583,7 @@ mod tests {
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::Admitted(Box::new(remote_session(
                     "two",
                     "/work/two",
@@ -1473,7 +1603,7 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![
                     SessionChange::Admitted(Box::new(session("one", Some("old"), "shell"))),
                     SessionChange::Admitted(Box::new(session("frozen", Some("old"), "git"))),
@@ -1481,7 +1611,7 @@ mod tests {
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("new"),
@@ -1512,14 +1642,14 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("step"),
                     "shell",
                 )))],
             ),
-            batch("inc:2", Reconciliation::Incremental, Vec::new()),
+            batch("inc:2", Scope::Incremental, Vec::new()),
         ]);
 
         publish_cycle(&mut store, &mut input, NAMESPACE, versions()).unwrap();
@@ -1547,7 +1677,7 @@ mod tests {
         let mut input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("old"),
@@ -1556,7 +1686,7 @@ mod tests {
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("new"),
@@ -1593,7 +1723,7 @@ mod tests {
         let mut incremental_input = QueuedInput::new([
             batch(
                 "inc:1",
-                Reconciliation::ReplaceNamespace,
+                Scope::Inventory,
                 vec![SessionChange::Admitted(Box::new(session(
                     "one",
                     Some("old"),
@@ -1602,7 +1732,7 @@ mod tests {
             ),
             batch(
                 "inc:2",
-                Reconciliation::Incremental,
+                Scope::Incremental,
                 vec![
                     SessionChange::Admitted(Box::new(final_one.clone())),
                     SessionChange::Admitted(Box::new(final_two.clone())),
@@ -1611,7 +1741,7 @@ mod tests {
         ]);
         let mut full_input = QueuedInput::new([batch(
             "full:1",
-            Reconciliation::ReplaceNamespace,
+            Scope::Inventory,
             vec![
                 SessionChange::Admitted(Box::new(final_one)),
                 SessionChange::Admitted(Box::new(final_two)),

@@ -124,6 +124,49 @@ fn materialize_publishes_once_and_reuses_its_namespace() {
 }
 
 #[test]
+fn materialize_waits_for_all_inventory_chunks() {
+    let home = fixture::Fixture::new();
+    let original = "00000000-0000-4000-8000-000000000001";
+    let project = "configured-claude/projects/fixture";
+    let transcript =
+        fs::read_to_string(home.root.join(format!("{project}/{original}.jsonl"))).unwrap();
+    let budget = semon_asi::input::ReadBudget::default().sessions.get();
+    let mut expected = Vec::new();
+    for number in 3..=budget + 1 {
+        let id = format!("00000000-0000-4000-8000-{number:012}");
+        home.write(
+            &format!("{project}/{id}.jsonl"),
+            transcript.replace(original, &id).as_bytes(),
+        );
+        expected.push(id);
+    }
+
+    let output = materialize(&home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = home.root.join("state");
+    let namespace = fs::read_to_string(state.join("analytics-namespace")).unwrap();
+    let store = state.join("analytics-store");
+    let manifest = semon_asi::read_manifest(&store).unwrap().unwrap();
+    let live = semon_asi::read_live_map(&store, &manifest).unwrap();
+    assert_eq!(live.len(), budget as usize + 1);
+    assert_eq!(
+        live.values()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([1, 2])
+    );
+    assert!(manifest.source_missing.is_empty());
+    for id in expected {
+        assert!(live.contains_key(&format!("{}/claude/{id}", namespace.trim())));
+    }
+    assert!(manifest.checkpoints[namespace.trim()].ends_with("\"cursor\":\"done\"}"));
+}
+
+#[test]
 fn materialize_refuses_an_unsupported_index_without_changing_its_bytes() {
     let home = fixture::Fixture::new();
     let index = home.root.join("state/index.sqlite3");

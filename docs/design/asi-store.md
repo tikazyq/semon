@@ -257,7 +257,7 @@ tables.
   materializations reuse that value. If the state directory is deleted, the
   next materialize has new session UIDs and no automatic reconciliation.
   Rename or transfer is a later explicit operator workflow. The writer opens a
-  separate read-only index connection per cycle, and its store-root helper uses
+  separate read-only index connection per chunk, and its store-root helper uses
   `<index parent>/analytics-store`, never a path inside the SQLite index file.
   A present store with a missing namespace file refuses instead of silently
   forking those identities.
@@ -271,7 +271,7 @@ tables.
   file. Analytics input opens refuse symlinks with SQLite NOFOLLOW; regular-file
   replacement by the same user is outside this boundary, since that user can
   already edit the state files. Each waiter owns a request generation and outcome;
-  success requires that generation's publication and compaction, never an
+  success requires that request's final chunk and compaction, never an
   intermediate Idle or manifest reload. SIGINT/SIGTERM cancels a CLI watch wait,
   then joins the writer and is re-raised. Watch exits on refresh/publication failure.
   A busy lock is observable as a no-writer state; unsupported input latches a refusal
@@ -282,12 +282,13 @@ tables.
 - **Local custody.** The generated Parquet can contain typed local-path
   fields. It remains local-only; a governed export is a separate operation and
   is not part of materialization.
-- **Cycle.** By default at most once every 2 s (the caller selects the interval), the writer reads the index change log and
-  recomputes every touched session **whole**. It doesn't patch tails: a
-  following step can change an earlier step's duration, and a late record can
-  change older rows. Per-cycle work is proportional to the touched sessions'
-  size; CI measures the cost without assuming a latency for large sessions.
-  - It writes one new file per table, `analytics/{table}/g{generation}.parquet`,
+- **Cycle.** The writer coalesces requests using a caller-selected interval
+  (2 s by default). Each chunk reads at most 64 sessions and 4,096 steps by
+  default. A session that exceeds the step budget occupies a chunk of its own.
+  Sessions are always projected whole because new evidence can change earlier
+  rows. Chunks within a successful cycle continue immediately, and each publishes
+  one generation. Journal reads also limit the number of scanned entries.
+  - Each chunk writes new files as `analytics/{table}/g{generation}.parquet`,
     holding the full rows of those sessions with a `_gen` column. Dimensions
     are rewritten whole, as `analytics/dim_x/g{generation}.parquet`.
     Their next state comes only from the currently named dimension files: replace
@@ -298,10 +299,11 @@ tables.
     dropped, as a typed Parquet file `analytics/live/g{generation}.parquet`, so the
     manifest stays small at any number of sessions.
   - It fsyncs those files, then writes `manifest.json`: the generation, file
-    lists with their compaction level, versions, each namespace's incarnation
-    and `seq` checkpoint, the durable revision checkpoint, and the live-map
-    file. It fsyncs the manifest, renames it into place, and fsyncs the
-    directory. A crash leaves the previous generation.
+    lists with their compaction level, versions, each namespace's authenticated
+    incarnation, snapshot sequence and cursor, the durable revision checkpoint,
+    and the live-map file. It fsyncs the manifest, renames it into place, and
+    fsyncs the directory. A restart resumes from the checkpoint in the last
+    visible generation. Earlier checkpoint formats are refused.
   - The local service coalesces catalog-publication notifications. Operational
     classification covers direct store I/O, Parquet `External` I/O, and SQLite
     busy/locked/I/O/full/cannot-open errors. These retry with bounded exponential
@@ -330,7 +332,7 @@ tables.
   table size, and a second compaction run straight after the first is a no-op.
   Compaction publishes as just another generation.
   The local service makes at most one bounded compaction attempt after a
-  successful publish.
+  completed publication cycle.
 - **Retirement.** A file leaves the store 10 minutes after the first
   published generation that no longer names it. Queries hold a snapshot for at
   most their deadline plus fetch time, well under that. The local service only
@@ -351,11 +353,17 @@ tables.
   must not replace a complete generation with a fragment. Re-derive at the origin
   when raw returns. A format mismatch refuses exactly; preserve or export frozen
   facts and custody, with no automatic reset or multi-version exception.
-- **Namespace reconciliation.** A `ReplaceNamespace` batch is a complete
-  inventory for its namespace. Every already-live session UID with that exact
-  encoded namespace component followed by `/` that the batch does not mention
-  is marked `source_missing`, retaining its rows and recorded versions; other
-  namespaces are untouched. A later `SourceRestored` clears the marker.
+- **Namespace reconciliation.** A cold read or new incarnation pages the
+  current Catalog and retained activity keys, including pending identities.
+  It then replays the journal from the sequence captured in the first chunk
+  through the head of the final SQLite read snapshot. Only the final chunk
+  carries the complete UID inventory and reconciles source availability.
+  Previously live UIDs absent from that namespace inventory, and sessions
+  whose sources are unavailable, get a `source_missing` marker while retaining
+  their facts. Explicit removals drop sessions. A later `SourceRestored` clears
+  a marker. The UID inventory, live-map merge and full session dimension still
+  use O(sessions) memory. The step evidence per chunk is bounded by the budget
+  with the exception of a single oversize session.
 - **Federated publication.** #555's immutable objects, `expected_parent` and
   namespace claim epochs publish complete admitted heads. Receiver imports carry
   per-origin heads and source, activity and transcript generations separately;

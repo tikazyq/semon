@@ -10,10 +10,12 @@ and FTS work; this lane does not edit those stack branches.
 `semon-asi` owns a typed index-input trait and pure whole-session projection.
 `semon-sessions` implements the trait over its internal activity readers. Read
 index incarnation, change sequence, catalog, complete admitted activity generation,
-StepFacts and provenance in one SQLite read transaction. The adapter owns strict
-incarnation/sequence checkpoint encoding and validation; incarnation changes cause
-a full namespace read. A pending or unavailable generation is distinct from an
-empty admitted session or an explicit removal.
+StepFacts and provenance in one SQLite read transaction per chunk. The adapter
+signs each checkpoint with the index incarnation and binds it to the namespace.
+The checkpoint records the first snapshot sequence and a Catalog or journal
+cursor during inventory. A new incarnation begins the inventory again. Pending
+or unavailable generations, empty admitted sessions and explicit removals have
+separate meanings.
 
 The ASI session UID is `(configured machine namespace, native harness, native
 session ID)`, percent-encoded component-wise. The Catalog key only disambiguates
@@ -103,14 +105,14 @@ The index path is trusted to be the user's own state file; each analytics input
 open refuses symlinks with SQLite NOFOLLOW. Another regular file swapped by the
 same user is outside this boundary, because that user can already edit the state.
 Each wait has its own request generation and outcome: success is settled only
-after that request's publication and compaction, never at an intermediate Idle
+after that request's final chunk and compaction, never at an intermediate Idle
 or successful manifest reload. Later requests cannot inherit a previous outcome.
 SIGINT/SIGTERM cancels pending waits, joins the writer, and is then re-raised.
 The writer coalesces notifications into at-most-one cycle per
-interval, opens a fresh read-only `SqliteAnalyticsInput` for each cycle, and
+interval. It opens a fresh read-only `SqliteAnalyticsInput` for each chunk and
 uses the current native activity-rules version and pricing snapshot fingerprint
-as manifest targets. It preserves the adapter's admitted input boundary:
-bounded input lands separately and is not a limit added by the writer.
+as manifest targets. Each chunk advances the manifest once. The writer runs
+continuations before settling the request and compacts once per completed cycle.
 
 Lock contention is an observable no-writer state. Unsupported or integrity input
 refuses visibly without mutating the SQLite index, advancing its checkpoint,
@@ -128,8 +130,7 @@ retry because a rename may already have published the generation. Reload success
 preserves the resumed operation's retry count. Every publication attempt advances
 the interval deadline, including rename-visible failures. Refusals consume only
 the pre-operation notification snapshot, leaving later notifications pending.
-The service attempts bounded compaction once after publication. Its slow
-retirement cadence can run ahead of an interval-gated publication while keeping
+Its slow retirement cadence can run ahead of an interval-gated publication while keeping
 that publication pending, but cannot bypass recovery barriers. Shutdown never
 schedules retirement.
 
@@ -159,11 +160,22 @@ one key refuse the cycle without advancing the checkpoint. Distinct price
 versions remain separate SCD2 rows. See the [store contract](asi-store.md) for
 the complete key and observation merge contract.
 
-A `ReplaceNamespace` inventory marks any prior live session under that exact
-encoded namespace component followed by `/` which it does not mention as
-`source_missing`; rows remain live and other namespaces are untouched. The
-adapter and publisher share `semon-asi`'s canonical UID component encoder. A
-later `SourceRestored` clears the marker.
+The reader pages the current Catalog and activity projections by key, so
+pending Catalog identities count as inventory members. It replays bounded
+journal chunks from the first inventory snapshot's sequence, even for keys
+behind the inventory cursor. Once it reaches the journal head in a single
+SQLite snapshot, the final chunk carries the complete set of inventory UIDs
+and the unavailable subset. The publisher reconciles missing sessions in
+that namespace only at completion. An interruption keeps the last visible
+checkpoint and preserves existing facts. The adapter and publisher share
+`semon-asi`'s canonical UID component encoder. A later `SourceRestored` clears
+the marker.
+
+The default chunk budget is 64 sessions and 4,096 steps. A session larger
+than the step budget occupies its own chunk. UID inventory and live-map
+merging still take O(sessions) memory, as does the session dimension.
+The chunk limits bound the remaining per-session evidence, apart from one
+oversize session.
 
 A reader loads the manifest once, its matching live map and exactly its named
 files. Filter session facts by `(session_uid, _gen)`; labels are append-only.

@@ -836,7 +836,7 @@ pub(crate) fn step_facts(
         }
         let ordinal =
             u64::try_from(record.get::<_, i64>(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
-        if ordinal != facts.len() as u64 {
+        if ordinal >= admitted.total || ordinal != facts.len() as u64 {
             return Ok(None);
         }
         let saved: SavedStep = from_json(1, &record.get::<_, String>(1)?)?;

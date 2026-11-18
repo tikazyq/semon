@@ -6198,7 +6198,7 @@ fn catalog_parent_provenance_distinguishes_native_agreement_from_observed_owners
             let mut input =
                 crate::SqliteAnalyticsInput::open(&EventCache::path(&options.cache), "machine")
                     .unwrap();
-            let batch = input.read_admitted(None).unwrap();
+            let batch = input.read_admitted(None, Default::default()).unwrap();
             let session = batch
                 .changes
                 .iter()

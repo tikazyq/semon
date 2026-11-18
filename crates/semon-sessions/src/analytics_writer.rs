@@ -1,7 +1,7 @@
 //! Local, explicitly-started origin analytics publication.
 //!
 //! This service has no host integration or default enablement. Its namespace is
-//! supplied by the caller, and each cycle opens a fresh read-only SQLite input.
+//! supplied by the caller, and each chunk opens a fresh read-only SQLite input.
 //! The store root derived by [`analytics_store_root`] is a sibling of the SQLite
 //! index, never a path inside the index file.
 //!
@@ -46,7 +46,7 @@ pub struct AnalyticsWriterConfig {
     pub store_root: PathBuf,
     /// Minimum spacing between publication cycles.
     pub interval: Duration,
-    /// Bounded policy used for one compaction attempt after each publication.
+    /// Bounded policy used for one compaction attempt after each completed cycle.
     pub compaction_policy: CompactionPolicy,
 }
 
@@ -731,11 +731,16 @@ fn run<C: Clock + Send + Sync + 'static>(
                 scheduler.publication_attempted(clock.now_ms(), config.interval);
                 consume_notification(&shared, notification);
                 match result {
-                    Ok(_) => {
+                    Ok(chunk) => {
                         scheduler.succeeded(operation, clock.now_ms());
                         #[cfg(test)]
                         published(&shared);
-                        set_status(&shared, AnalyticsWriterStatus::Idle);
+                        if chunk.more {
+                            scheduler.pending = Some(Operation::Publish);
+                            scheduler.next_cycle = clock.now_ms();
+                        } else {
+                            set_status(&shared, AnalyticsWriterStatus::Idle);
+                        }
                     }
                     Err(PublishError::Input(error)) if is_input_operational(&error) => {
                         retry_operation(

@@ -150,8 +150,12 @@ local paths can be present in the Parquet, so governed export remains a
 separate operation. Writer ownership is acquired before namespace creation or
 Catalog refresh; contention returns `analytics writer busy` without changing the
 index or namespace. Corrupt or unsupported indexes are refused unchanged.
-Catalog refresh is complete; `--since`/`--all` do not bound analytics input.
-Each request waits for publication and compaction; operational failures exhaust
+Catalog refresh is complete. Analytics input is paged independently of
+`--since`/`--all`, by default at 64 sessions or 4,096 steps per chunk. A large
+session occupies a chunk of its own. Interrupted inventories resume from the
+manifest and reconcile missing sessions after the final chunk. The UID inventory
+and live-map merge still use memory proportional to the number of sessions.
+Each request waits for all chunks and compaction. Operational failures exhaust
 a three-failure budget (up to 1s/2s backoffs plus publication spacing) and report
 the last error. `--watch` exits on refresh or publication failure and cancels its
 wait on SIGINT/SIGTERM before joining the writer and re-raising the signal.
