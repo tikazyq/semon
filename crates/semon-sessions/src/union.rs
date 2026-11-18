@@ -1110,6 +1110,7 @@ impl ViewerCore {
             && !matches!(
                 path,
                 "/api/sessions"
+                    | "/api/session-activity-anchor"
                     | "/api/session-transcript"
                     | "/api/session-resolve"
                     | "/api/session-annotations"
@@ -1185,6 +1186,7 @@ impl ViewerCore {
                 | "/api/session-capabilities"
                 | "/api/session-identity"
                 | "/api/session-anchor"
+                | "/api/session-activity-anchor"
                 | "/api/session-annotations"
                 | "/api/session-trace"
                 | "/api/session-home"
@@ -1478,6 +1480,14 @@ impl ViewerCore {
                 "/api/session-transcript" | "/api/session-entry" => {
                     view.evidence.storage.transcript(key, query, None)
                 }
+                "/api/session-activity-anchor" => ViewerReply {
+                    status: 200,
+                    content_type: "application/json; charset=utf-8",
+                    body: crate::activity_anchor::unavailable("unsupported_storage")
+                        .to_string()
+                        .into_bytes(),
+                    etag: None,
+                },
                 "/api/session-annotations" => view.evidence.storage.annotations(query),
                 "/api/session-resolve" => crate::native_resolution::page_with_reader(
                     key,
@@ -1526,6 +1536,13 @@ impl ViewerCore {
                     Ok(())
                 },
             ),
+            "/api/session-activity-anchor" => {
+                crate::session_activity_anchor_with_gate(view.options(), key, query, || {
+                    refresh_error =
+                        Some(wait_for_catalog_read(view, deadline, allow_catalog_wait)?);
+                    Ok(())
+                })
+            }
             "/api/session-anchor" => {
                 crate::session_turn_anchor_with_gate(view.options(), key, query, || {
                     refresh_error =

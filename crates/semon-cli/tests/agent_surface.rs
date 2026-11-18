@@ -608,6 +608,21 @@ fn check_schema(tool: &str, schema: &Value) {
     let properties = schema["properties"].as_object().unwrap();
     assert!(!properties.is_empty(), "{tool}");
     for (name, property) in properties {
+        if property["type"] == "object" {
+            assert_eq!((tool, name.as_str()), ("read_transcript", "step"));
+            assert_eq!(property["additionalProperties"], false);
+            assert_eq!(property["required"], json!(["generation", "ordinal", "id"]));
+            assert_eq!(property["properties"]["generation"]["type"], "string");
+            assert_eq!(property["properties"]["ordinal"]["minimum"], 0);
+            assert_eq!(
+                property["properties"]["id"]["oneOf"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            continue;
+        }
         let property = property.as_object().unwrap();
         for key in property.keys() {
             assert!(
@@ -734,6 +749,16 @@ fn semon_mcp_speaks_the_protocol_and_serves_every_tool() {
         );
         assert_eq!(tool["annotations"]["readOnlyHint"], true, "{name}");
         check_schema(name, &tool["inputSchema"]);
+        if name == "read_transcript" {
+            let step = &tool["inputSchema"]["properties"]["step"];
+            assert_eq!(step["type"], "object");
+            assert_eq!(step["required"], json!(["generation", "ordinal", "id"]));
+            assert_eq!(step["additionalProperties"], false);
+            assert_eq!(
+                step["properties"]["id"]["oneOf"].as_array().unwrap().len(),
+                2
+            );
+        }
     }
 
     // Stale search is an explicit tool error before native/cache admission,

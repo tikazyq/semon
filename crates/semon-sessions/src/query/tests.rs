@@ -6288,6 +6288,244 @@ fn paused_find_refuses_all_public_boundaries_before_evidence_or_provider_admissi
     assert!(!crate::events::EventCache::path(&home.options.cache).exists());
 }
 
+#[test]
+fn activity_step_anchors_resolve_exact_claude_records_and_refuse_stale_inputs() {
+    let home = activity_fixture();
+    let mut query = home.query();
+    call(&mut query, "get_session", json!({"id":"activity"}));
+    let page = call(&mut query, "get_session_activity", json!({"id":"activity"}));
+    let step = json!({"generation":page["generation"],"ordinal":0,"id":page["items"][0]["id"]});
+    let options = query.sources.machines[0].1.options.clone();
+    let db = rusqlite::Connection::open(crate::events::EventCache::path(&options.cache)).unwrap();
+    let text: String = db
+        .query_row(
+            "SELECT metadata FROM session_catalog WHERE session_key='activity'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let row = serde_json::from_str(&text).unwrap();
+    let price = crate::pricing::snapshot();
+    let resolve = |step: &Value| {
+        crate::activity_anchor::resolve(&db, &row, step, &price.fingerprint, false).unwrap()
+    };
+    let anchor = resolve(&step);
+    assert_eq!(anchor["available"], true, "{anchor}");
+    assert_eq!(anchor["basis"], "usage_record");
+    assert!(anchor.get("position").is_none());
+    let page = super::transcript::read(
+        &options,
+        "activity",
+        &json!({"id":"activity","step":step,"limit":1}),
+        None,
+        crate::SessionSourceReadMode::LocalThenProvider,
+        NOW,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(page["from"], anchor["slot"]);
+    assert_eq!(page["entries"][0]["k"], "a");
+    let http_query = format!(
+        "sid=activity&scope=retained_history&generation={}&ordinal=0&id={}",
+        step["generation"].as_str().unwrap(),
+        crate::viewer::percent_encode(&step["id"].to_string())
+    );
+    let core = ViewerCore::new(home.options.clone());
+    let response = core.respond("GET", "/api/session-activity-anchor", &http_query, None);
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let response: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(response, anchor);
+    assert_eq!(
+        crate::session_activity_anchor(&options, "local", &(http_query.clone() + "&ordinal=1"))
+            .status,
+        400
+    );
+    assert_eq!(
+        crate::activity_anchor::resolve(&db, &row, &step, "changed-price", false).unwrap()["reason"],
+        "stale_activity"
+    );
+    for (field, value) in [
+        ("generation", json!("obsolete")),
+        ("id", json!({"Claude":"wrong"})),
+        ("ordinal", json!(100)),
+    ] {
+        let mut stale = step.clone();
+        stale[field] = value;
+        assert_eq!(resolve(&stale)["reason"], "stale_activity");
+        let error = super::transcript::read(
+            &options,
+            "activity",
+            &json!({"id":"activity","step":stale}),
+            None,
+            crate::SessionSourceReadMode::LocalThenProvider,
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, Some("stale_activity"));
+    }
+    db.execute(
+        "UPDATE session_activity_projections SET rules_version=0",
+        [],
+    )
+    .unwrap();
+    assert_eq!(resolve(&step)["reason"], "stale_activity");
+    db.execute(
+        "UPDATE session_activity_projections SET rules_version=?1",
+        [crate::events::session_activity::ACTIVITY_RULES_VERSION],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE session_activity_projections SET source_generation='wrong'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(resolve(&step)["reason"], "source_generation_mismatch");
+    db.execute(
+        "UPDATE session_activity_projections SET source_generation=?1",
+        [anchor["source_generation"].as_str().unwrap()],
+    )
+    .unwrap();
+    db.execute("UPDATE session_slot_projections SET version=0", [])
+        .unwrap();
+    assert_eq!(resolve(&step)["reason"], "stale_transcript");
+    db.execute(
+        "UPDATE session_slot_projections SET version=?1",
+        [crate::slot_projection::VERSION],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE session_slot_projections SET source_generation='wrong'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(resolve(&step)["reason"], "source_generation_mismatch");
+    db.execute(
+        "UPDATE session_slot_projections SET source_generation=?1",
+        [anchor["source_generation"].as_str().unwrap()],
+    )
+    .unwrap();
+    db.execute("UPDATE session_slot_projections SET total=total+1", [])
+        .unwrap();
+    assert_eq!(resolve(&step)["reason"], "history_incomplete");
+    db.execute("UPDATE session_slot_projections SET total=total-1", [])
+        .unwrap();
+    // UUID evidence outranks the exact usage offset, and user entries cannot match.
+    db.execute("UPDATE session_activity_steps SET metadata=json_set(metadata,'$.usage.Claude.record_ids',json('[\"assistant-uuid\"]')) WHERE ordinal=0",[]).unwrap();
+    db.execute("UPDATE session_slots SET metadata=json_set(metadata,'$.native_event_id','assistant-uuid') WHERE session_key='activity' AND slot=?1",[anchor["slot"].as_i64().unwrap()]).unwrap();
+    assert_eq!(resolve(&step)["basis"], "message_record_id");
+    let capped: Vec<_> = (0..257).map(|n| format!("uuid-{n:03}")).collect();
+    db.execute("UPDATE session_activity_steps SET metadata=json_set(metadata,'$.usage.Claude.record_ids',json(?1)) WHERE ordinal=0",[serde_json::to_string(&capped).unwrap()]).unwrap();
+    db.execute("UPDATE session_slots SET metadata=json_set(metadata,'$.native_event_id','uuid-256') WHERE session_key='activity' AND slot=?1",[anchor["slot"].as_i64().unwrap()]).unwrap();
+    assert_eq!(resolve(&step)["reason"], "no_exact_record");
+    db.execute("UPDATE session_slots SET metadata=json_set(metadata,'$.native_event_id','uuid-255') WHERE session_key='activity' AND slot=?1",[anchor["slot"].as_i64().unwrap()]).unwrap();
+    assert_eq!(resolve(&step)["basis"], "message_record_id");
+    db.execute("UPDATE session_slots SET metadata=json_set(metadata,'$.native_event_id','different','$.offset',999999) WHERE session_key='activity'",[]).unwrap();
+    assert_eq!(resolve(&step)["reason"], "no_exact_record");
+    // Retained headers must explicitly establish complete history.
+    db.execute("INSERT INTO session_history_projections(session_key,generation,source_generation,version,total,incomplete) SELECT session_key,generation,source_generation,version,total,1 FROM session_slot_projections WHERE session_key='activity'",[]).unwrap();
+    assert_eq!(
+        crate::activity_anchor::resolve(&db, &row, &step, &price.fingerprint, true).unwrap()["reason"],
+        "history_incomplete"
+    );
+}
+
+#[test]
+fn codex_activity_anchor_requires_full_call_identity_and_maps_operations_to_parent() {
+    let home = Home::new("codex-anchors");
+    let identity = json!({"thread_id":"cx","session_id":"cx","turn_id":"t","response_id":"r"});
+    let mut call_record = json!({"type":"function_call","name":"exec_command","call_id":"call","arguments":"{\"cmd\":\"pwd\"}"});
+    call_record
+        .as_object_mut()
+        .unwrap()
+        .extend(identity.as_object().unwrap().clone());
+    let mut usage = identity.clone();
+    usage["usage"] = json!({"input_tokens":100,"output_tokens":10,"total_tokens":110,"cached_input_tokens":0,"cache_write_input_tokens":0,"reasoning_output_tokens":0});
+    home.lines("codex/sessions/2026/09/24/rollout-cx.jsonl",&[
+        codex_line(ts(5,0),"session_meta",json!({"id":"cx","cwd":"/work/proj","originator":"codex_exec","thread_source":"user"})),
+        codex_line(ts(5,1),"response_item",json!({"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic task"}]})),
+        codex_line(ts(5,2),"turn_context",json!({"model":"gpt-test"})),
+        codex_line(ts(5,3),"response_item",call_record),
+        codex_line(ts(5,4),"response_item",json!({"type":"function_call_output","call_id":"call","output":"/work/proj"})),
+        codex_line(ts(5,5),"token_usage_record",usage),
+    ]);
+    let mut query = home.query();
+    call(&mut query, "get_session", json!({"id":"cx"}));
+    let page = call(&mut query, "get_session_activity", json!({"id":"cx"}));
+    let step = json!({"generation":page["generation"],"ordinal":0,"id":page["items"][0]["id"]});
+    let options = &query.sources.machines[0].1.options;
+    let db = rusqlite::Connection::open(crate::events::EventCache::path(&options.cache)).unwrap();
+    let metadata: String = db
+        .query_row(
+            "SELECT metadata FROM session_catalog WHERE session_key='cx'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let row = serde_json::from_str(&metadata).unwrap();
+    let price = crate::pricing::snapshot();
+    let resolve =
+        || crate::activity_anchor::resolve(&db, &row, &step, &price.fingerprint, false).unwrap();
+    let anchor = resolve();
+    assert_eq!(anchor["available"], true, "{anchor}");
+    assert_eq!(anchor["basis"], "tool_call");
+    // A rendered code-mode operation carries its parent's call offset, not an
+    // internal call address. Replace only the content-free synthetic recipe.
+    let slot = anchor["slot"].as_i64().unwrap();
+    db.execute("UPDATE session_slots SET metadata=json_set(metadata,'$.recipe',json_object('recipe','Operation','kind','shell','ok',1,'script_offset',json_extract(metadata,'$.offset')),'$.offset',999999) WHERE session_key='cx' AND slot=?1",[slot]).unwrap();
+    assert_eq!(resolve()["slot"], slot);
+    db.execute("UPDATE events SET y=json_set(y,'$.activity_observation.step_id.Codex[0]','other-thread') WHERE k='tool'",[]).unwrap();
+    assert_eq!(resolve()["reason"], "no_exact_record");
+    db.execute("UPDATE events SET y=json_set(y,'$.activity_observation.step_id.Codex[0]','cx'),parent=0 WHERE k='tool'",[]).unwrap();
+    assert_eq!(resolve()["reason"], "no_exact_record");
+    // Text-only records with the same turn cannot create a call anchor.
+    db.execute("DELETE FROM events WHERE k='tool'", []).unwrap();
+    assert_eq!(resolve()["reason"], "no_exact_record");
+}
+
+#[test]
+fn activity_step_anchor_schema_and_memory_fallback_are_explicit() {
+    let step =
+        json!({"generation":"g","ordinal":0,"id":{"Codex":["thread","session","turn","response"]}});
+    assert!(validate_query_call("read_transcript", &json!({"id":"done","step":step})).is_ok());
+    for args in [
+        json!({"id":"done","step":step,"turn":"turn"}),
+        json!({"id":"done","step":step,"after":0}),
+        json!({"id":"done","step":step,"before":0}),
+        json!({"id":"done","step":{"generation":"g","ordinal":-1,"id":{"Claude":"m"}}}),
+        json!({"id":"done","step":{"generation":"g","ordinal":0,"id":{"Codex":["response"]}}}),
+        json!({"id":"done","step":{"generation":"g","ordinal":0}}),
+    ] {
+        assert!(
+            validate_query_call("read_transcript", &args).is_err(),
+            "{args}"
+        );
+    }
+    let home = fixture();
+    let mut query = home.query();
+    assert_eq!(
+        query
+            .read_transcript(&json!({"id":"done","step":step}), NOW, None)
+            .unwrap_err()
+            .reason,
+        Some("unsupported_storage")
+    );
+    let tools = query_tools();
+    let schema = &tools
+        .iter()
+        .find(|tool| tool.name == "read_transcript")
+        .unwrap()
+        .input_schema;
+    assert_eq!(
+        schema["properties"]["step"]["required"],
+        json!(["generation", "ordinal", "id"])
+    );
+}
+
 mod recovery_tests;
 
 // Historical captures predate activity analytics. Project away only the added

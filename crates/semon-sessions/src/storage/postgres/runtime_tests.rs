@@ -240,6 +240,20 @@ pub(super) fn lifecycle(dsn: &str) {
             .code,
         "capability_unavailable"
     );
+    assert_eq!(
+        query
+            .call_selected(
+                "injected-runtime",
+                key,
+                "read_transcript",
+                &json!({"id":key,"step":{"generation":"g","ordinal":0,"id":{"Claude":"message"}}}),
+                None,
+                crate::SessionSourceReadMode::LocalOrPinnedProvider
+            )
+            .unwrap_err()
+            .reason,
+        Some("unsupported_storage")
+    );
     // A foreign source key cannot use this app-owned capability, even if the
     // same native paths exist. Lower-level conformance proves forced-RLS SQL.
     let foreign = evidence.storage.page(

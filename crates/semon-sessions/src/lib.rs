@@ -102,7 +102,10 @@ pub mod sealed;
 pub mod shell;
 mod slot_projection;
 pub use read_capabilities::{SessionReadEndpoints, session_catalog_capabilities};
+mod activity_anchor;
 mod transcript_range;
+pub use activity_anchor::session_activity_anchor;
+pub(crate) use activity_anchor::session_activity_anchor_with_gate;
 pub use transcript_range::{
     SessionSourceReadMode, session_annotations, session_entry_field, session_entry_field_with_mode,
     session_transcript_range, session_transcript_range_with_mode, session_turn_anchor,

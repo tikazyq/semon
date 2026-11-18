@@ -88,7 +88,20 @@ Event Index or preparing a semantic cohort. Catalog publishes exact call/error
 counts and pending/background observations under its source/runtime fence;
 recipes themselves grant no live authority. The shared renderer keeps original
 slot addresses and the preceding Thinking timestamp. Turn anchors use the
-existing selected-session turn indexes. Completion rechecks the selected row,
+existing selected-session turn indexes. A fourth mutually exclusive anchor,
+`step: {generation, ordinal, id}`, uses the generation and exact native ID from
+`get_session_activity`; the ordinal selects and verifies the stored step, never
+acts as a transcript address. CLI accepts this object as JSON with `--step`.
+The resolver checks activity source/rules/prices and complete transcript source
+agreement in the focused read's SQLite snapshot, before reading original bytes.
+It requires an exact assistant UUID/usage record (Claude) or full-identity native
+call, including the parent of rendered code-mode operations (Codex). Text-only
+Codex responses and unrendered records have no anchor. In-memory fallback and
+PostgreSQL refuse step anchors with `unsupported_storage`. Other closed refusals
+are `stale_activity`, `stale_transcript`, `source_generation_mismatch`,
+`history_incomplete` and `no_exact_record`, carried in the tool error's `reason`.
+See [the complete anchor contract](../../../../docs/design/session-activity-analytics.md#exact-transcript-anchors).
+Completion rechecks the selected row,
 slot generation, touched sources and runtime, permitting unrelated publication.
 Recipe windows stop at 512 candidates plus one preceding context row; selected
 recipe metadata and content-free proof hashes each have a 4 MiB read budget.

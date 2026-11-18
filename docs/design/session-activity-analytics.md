@@ -17,6 +17,43 @@ usage decoder and an `accepted` model outcome. Duplicate, conflict and
 unavailable outcomes do not contribute steps. A source receipt must already be
 qualified by the caller; the pure function does not grant source authority.
 
+## Exact transcript anchors
+
+`/api/session-activity-anchor` accepts `sid`, optional machine and
+`scope=retained_history`, activity `generation`, zero-based `ordinal` and a
+URL-encoded JSON native step `id`. The selected Catalog identity, activity
+header/step and transcript recipes are read in one SQLite snapshot. The activity
+header must match the requested generation, current rules and pricing snapshot;
+the stored step ID must equal the request. Both projections must bind the same
+selected source vector. Transcript recipes must have the current version and
+complete history. No native body is read or source path returned.
+
+For Claude, select the lowest assistant-authored slot whose native record UUID
+belongs to the message's retained UUID set (at most 256), then the lowest exact
+usage-record path/offset if no UUID matches. Records excluded by the UUID cap
+cannot become UUID anchors or bypass the cap through that fallback. For Codex,
+only the earliest native tool call carrying the full thread/session/turn/response
+tuple qualifies; rendered code-mode operations resolve through their parent call.
+Internal call positions, text-only responses and steps with no rendered exact
+record are unavailable. Ordinals, timestamps, turns and neighbouring records
+never establish a transcript join.
+
+Success is `{available:true, activity_generation, step:{ordinal,id},
+source_generation, transcript_generation, slot, basis}`. `basis` is
+`message_record_id`, `usage_record` or `tool_call`. Pass `transcript_generation`
+with the subsequent transcript slot read. Failure is `{available:false, reason}`
+with `stale_activity`, `stale_transcript`, `source_generation_mismatch`,
+`history_incomplete`, `no_exact_record` or `unsupported_storage`.
+
+`read_transcript` accepts `step:{generation,ordinal,id}`, mutually exclusive
+with `before`, `after` and `turn`. It resolves inside the focused transcript
+read's snapshot and keeps the existing source-byte and publication fences. A
+refusal carries the same closed reason in the tool error; it never silently
+reads a tail page. In-memory fallback and PostgreSQL do not support this anchor.
+The Jump UI is separate work.
+
+## Derivation
+
 Context is input plus cache read plus cache write. Bands are below 50,000,
 50,000 through 150,000 inclusive, and above 150,000. One immutable pricing
 snapshot prices each step. Every step carries four nullable dollar components,
@@ -50,7 +87,8 @@ parent and child steps must never create a family thrash window.
 Schema 41 stores a session activity header, ordered step rows keyed by
 `(session_key, generation, ordinal)`, separate ordered compaction rows, compact summary metadata, and typed
 change facts keyed by session, generation and stable identity.
-Parser 38 retains the exact last Claude usage observation offset alongside the
+Parser 39 qualifies on-demand step anchors using the exact last Claude usage
+observation offset alongside the
 existing message ID and assistant UUIDs. The producer uses its established file
 merge order and copied-record ownership map; Codex reads only model-accepted
 facts whose normalized source receipt matches the selected consumed ledger.
@@ -81,7 +119,7 @@ activity generation. Unknown prices remain unknown. Step arrays stay out of cach
 relationships rather than entering the stable description cache. Catalog version 8
 and the semantic recipe bind this output.
 
-Rules version 8 classifies the first waste per step in this order: orchestration
+Rules version 9 qualifies exact on-demand transcript anchors and classifies the first waste per step in this order: orchestration
 wait or checks pending, explicit tool failure or repeat (retry, flaky rerun), refill
 after compaction, redundant read. Failures retain path-not-found, malformed-command, timeout and rejected
 tool input (Tooling), rate/auth/network/server failure (External), checks pending

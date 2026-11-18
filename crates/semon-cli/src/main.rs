@@ -255,6 +255,9 @@ fn parse_query_args(mut arguments: impl Iterator<Item = String>) -> Result<Query
                         raw.parse::<i64>()
                             .map_err(|_| format!("{flag} expects an integer, got {raw}"))?,
                     )
+                } else if property["type"] == "object" {
+                    serde_json::from_str(&raw)
+                        .map_err(|_| format!("{flag} expects a JSON object"))?
                 } else {
                     serde_json::Value::String(raw)
                 };
@@ -859,6 +862,29 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_step_flag_accepts_the_agent_surface_json_object() {
+        let step = r#"{"generation":"generation","ordinal":0,"id":{"Claude":"message"}}"#;
+        let args = parse_query_args(
+            ["read_transcript", "session", "--step", step]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            args.arguments["step"],
+            serde_json::from_str::<serde_json::Value>(step).unwrap()
+        );
+        assert!(
+            parse_query_args(
+                ["read_transcript", "session", "--step", "invalid"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn paused_find_refuses_stale_and_malformed_cli_calls_before_initialization() {

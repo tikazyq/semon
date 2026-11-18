@@ -598,7 +598,14 @@ pub(super) fn read(
     mode: crate::SessionSourceReadMode,
     now: i64,
 ) -> Result<Option<Value>, QueryError> {
-    read_inner(options, key, args, provider, mode, now, None)
+    let result = read_inner(options, key, args, provider, mode, now, None)?;
+    if result.is_none() && !args["step"].is_null() {
+        return Err(QueryError {
+            reason: Some("stale_transcript"),
+            ..unavailable("Activity anchor transcript is unavailable")
+        });
+    }
+    Ok(result)
 }
 
 pub(super) fn session(
@@ -685,10 +692,52 @@ fn read_inner(
             .optional().map_err(unavailable)?.flatten(),
     };
     let Some(text) = text else {
+        if !args["step"].is_null() {
+            return Err(QueryError {
+                reason: Some("no_exact_record"),
+                ..QueryError::new(
+                    "stale_projection",
+                    "Virtual transcripts have no native activity anchor",
+                )
+            });
+        }
         tx.commit().map_err(unavailable)?;
         return virtual_read(options, key, args, provider, mode, now);
     };
     let row: CatalogRow = serde_json::from_str(&text).map_err(unavailable)?;
+    let step_anchor = if !args["step"].is_null() {
+        let resolved = crate::activity_anchor::resolve(
+            &tx,
+            &row,
+            &args["step"],
+            &crate::pricing::snapshot().fingerprint,
+            history.is_some(),
+        )
+        .map_err(unavailable)?;
+        if resolved["available"] != true {
+            let reason = match resolved["reason"].as_str() {
+                Some("stale_activity") => "stale_activity",
+                Some("source_generation_mismatch") => "source_generation_mismatch",
+                Some("history_incomplete") => "history_incomplete",
+                Some("no_exact_record") => "no_exact_record",
+                _ => "stale_transcript",
+            };
+            return Err(QueryError {
+                reason: Some(reason),
+                ..QueryError::new(
+                    "stale_projection",
+                    "Exact activity transcript anchor unavailable",
+                )
+            });
+        }
+        Some(
+            resolved["slot"]
+                .as_u64()
+                .ok_or_else(|| unavailable("Invalid activity slot"))? as usize,
+        )
+    } else {
+        None
+    };
     if row.sources.iter().any(|source| {
         !crate::model::catalog_source_in_window(source, crate::model::scan_cutoff(options, now))
     }) {
@@ -768,29 +817,33 @@ fn read_inner(
     let position = |name: &str| integer(args, name).map(|value| value.max(0) as usize);
     let anchor = tx::Anchor::of(position("before"), position("after"), string(args, "turn"))
         .ok_or_else(|| QueryError::invalid("before, after and turn are exclusive"))?;
-    let (forward, from) = match &anchor {
-        tx::Anchor::Last => (false, total),
-        tx::Anchor::Before(before) => (false, (*before).min(total)),
-        tx::Anchor::After(after) => (true, (*after).min(total)),
-        tx::Anchor::Turn(turn) => {
-            let turn_column = if history.is_some() {
-                "json_extract(metadata,'$.turn')"
-            } else {
-                "CASE WHEN json_valid(metadata) THEN json_extract(metadata,'$.turn') END"
-            };
-            let first: Option<i64> = tx.query_row(&format!(
+    let (forward, from) = if let Some(slot) = step_anchor {
+        (true, slot)
+    } else {
+        match &anchor {
+            tx::Anchor::Last => (false, total),
+            tx::Anchor::Before(before) => (false, (*before).min(total)),
+            tx::Anchor::After(after) => (true, (*after).min(total)),
+            tx::Anchor::Turn(turn) => {
+                let turn_column = if history.is_some() {
+                    "json_extract(metadata,'$.turn')"
+                } else {
+                    "CASE WHEN json_valid(metadata) THEN json_extract(metadata,'$.turn') END"
+                };
+                let first: Option<i64> = tx.query_row(&format!(
                 "SELECT slot FROM {table} WHERE session_key=?1 AND {turn_column}=?2 AND json_extract(metadata,'$.first')=1 ORDER BY slot LIMIT 1"
             ), params![key,turn], |row|row.get(0)).optional().map_err(unavailable)?;
-            (
-                true,
-                usize::try_from(first.ok_or_else(|| {
-                    QueryError::new(
-                        "unknown_turn",
-                        format!("session {key:?} has no turn {turn:?}"),
-                    )
-                })?)
-                .map_err(unavailable)?,
-            )
+                (
+                    true,
+                    usize::try_from(first.ok_or_else(|| {
+                        QueryError::new(
+                            "unknown_turn",
+                            format!("session {key:?} has no turn {turn:?}"),
+                        )
+                    })?)
+                    .map_err(unavailable)?,
+                )
+            }
         }
     };
     let limit = integer(args, "limit").map_or(tx::PAGE_ENTRIES, |value| value as usize);

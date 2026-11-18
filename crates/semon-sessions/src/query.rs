@@ -344,6 +344,7 @@ fn retained_query_tools() -> Vec<QueryTool> {
                     "before": {"type": "integer", "minimum": 0, "description": "The page ending before this position (a page's from)."},
                     "after": {"type": "integer", "minimum": 0, "description": "The page starting at this position (a page's to)."},
                     "turn": {"type": "string", "minLength": 1, "description": "The page starting at this turn's first entry."},
+                    "step": {"type":"object","description":"Exact activity step anchor; exclusive with before, after and turn. Requires SQLite projections.","properties":{"generation":{"type":"string","minLength":1,"maxLength":128},"ordinal":{"type":"integer","minimum":0},"id":{"description":"Native step identity returned by get_session_activity.","oneOf":[{"type":"object","properties":{"Claude":{"type":"string","minLength":1,"maxLength":4096}},"required":["Claude"],"additionalProperties":false},{"type":"object","properties":{"Codex":{"type":"array","items":{"type":"string","minLength":1,"maxLength":4096},"minItems":4,"maxItems":4}},"required":["Codex"],"additionalProperties":false}]}},"required":["generation","ordinal","id"],"additionalProperties":false},
                     "limit": {"type": "integer", "minimum": 1, "maximum": tx::PAGE_ENTRIES, "default": tx::PAGE_ENTRIES, "description": "At most this many entries."},
                 },
                 "required": ["id"],
@@ -462,6 +463,7 @@ fn validate(schema: &Value, args: &Value) -> Result<(), QueryError> {
                     )));
                 }
             }
+            Some("object") => validate(property, value)?,
             _ => {}
         }
     }
@@ -876,6 +878,35 @@ fn validate_tool_call(tools: &[QueryTool], tool: &str, args: &Value) -> Result<(
     let empty = json!({});
     let args = if args.is_null() { &empty } else { args };
     validate(&spec.input_schema, args)?;
+    if tool == "read_transcript" {
+        if ["before", "after", "turn", "step"]
+            .iter()
+            .filter(|name| args.get(**name).is_some_and(|v| !v.is_null()))
+            .count()
+            > 1
+        {
+            return Err(QueryError::invalid(
+                "before, after, turn and step are exclusive",
+            ));
+        }
+        if let Some(step) = args.get("step").filter(|v| !v.is_null()) {
+            let id = serde_json::from_value::<crate::events::session_activity::ActivityStepId>(
+                step["id"].clone(),
+            )
+            .map_err(|_| QueryError::invalid("step requires a native activity id"))?;
+            let valid = match id {
+                crate::events::session_activity::ActivityStepId::Claude(id) => {
+                    !id.is_empty() && id.len() <= 4096
+                }
+                crate::events::session_activity::ActivityStepId::Codex(ids) => {
+                    ids.iter().all(|id| !id.is_empty() && id.len() <= 4096)
+                }
+            };
+            if !valid {
+                return Err(QueryError::invalid("Invalid native activity id"));
+            }
+        }
+    }
     since_ms(args, now_ms())?;
     Ok(())
 }
@@ -1059,6 +1090,12 @@ impl Query {
             .machines
             .iter()
             .any(|(_, source)| source.storage.is_postgres());
+        if postgres && tool == "read_transcript" && !args["step"].is_null() {
+            return Err(QueryError {
+                reason: Some("unsupported_storage"),
+                ..QueryError::new("capability_unavailable", "Activity anchors require SQLite")
+            });
+        }
         if postgres && tool == "get_session_activity" {
             return Err(QueryError::new(
                 "capability_unavailable",
@@ -1348,6 +1385,12 @@ impl Query {
         if self.sources.is_retired() {
             return Err(QueryError::new("io", "native query source is closed"));
         }
+        if evidence.storage.is_postgres() && tool == "read_transcript" && !args["step"].is_null() {
+            return Err(QueryError {
+                reason: Some("unsupported_storage"),
+                ..QueryError::new("capability_unavailable", "Activity anchors require SQLite")
+            });
+        }
         if evidence.storage.is_postgres() && tool == "get_session_activity" {
             return Err(QueryError::new(
                 "capability_unavailable",
@@ -1454,6 +1497,15 @@ impl Query {
             }
             answer["window_start"] = json!(self.start);
             return Ok(answer);
+        }
+        if tool == "read_transcript" && !args["step"].is_null() {
+            return Err(QueryError {
+                reason: Some("unsupported_storage"),
+                ..QueryError::new(
+                    "capability_unavailable",
+                    "Activity anchors require a qualified SQLite transcript projection",
+                )
+            });
         }
         let result = evidence
             .storage
@@ -1635,6 +1687,15 @@ impl Query {
             crate::SessionSourceReadMode,
         )>,
     ) -> Result<Value, QueryError> {
+        if !args["step"].is_null() {
+            return Err(QueryError {
+                reason: Some("unsupported_storage"),
+                ..QueryError::new(
+                    "capability_unavailable",
+                    "Activity anchors require a qualified SQLite transcript projection",
+                )
+            });
+        }
         let id = string(args, "id").unwrap_or_default();
         let position = |key: &str| integer(args, key).map(|value| value.max(0) as usize);
         let anchor = tx::Anchor::of(position("before"), position("after"), string(args, "turn"))
