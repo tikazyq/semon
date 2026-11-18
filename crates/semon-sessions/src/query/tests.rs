@@ -6288,10 +6288,34 @@ fn paused_find_refuses_all_public_boundaries_before_evidence_or_provider_admissi
     assert!(!crate::events::EventCache::path(&home.options.cache).exists());
 }
 
+// Activity preparation publishes its own source recipe, independently of the
+// transcript Catalog. Anchor fixtures need both producer publications.
+fn activity_anchor_query(home: &Home) -> Query {
+    let sources = admitted(home.options.clone());
+    let evidence = &sources.machines[0].1;
+    let mut complete = false;
+    {
+        let mut work = evidence.storage.work.lock().unwrap();
+        for _ in 0..16 {
+            if evidence.refresh_catalog(&mut work, NOW).unwrap() {
+                complete = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        complete,
+        "anchor fixture Catalog publication did not complete"
+    );
+    let mut query = Query::from_sources(sources);
+    query.embedded = false;
+    query
+}
+
 #[test]
 fn activity_step_anchors_resolve_exact_claude_records_and_refuse_stale_inputs() {
     let home = activity_fixture();
-    let mut query = home.query();
+    let mut query = activity_anchor_query(&home);
     call(&mut query, "get_session", json!({"id":"activity"}));
     let page = call(&mut query, "get_session_activity", json!({"id":"activity"}));
     let step = json!({"generation":page["generation"],"ordinal":0,"id":page["items"][0]["id"]});
@@ -6453,7 +6477,7 @@ fn codex_activity_anchor_requires_full_call_identity_and_maps_operations_to_pare
         codex_line(ts(5,4),"response_item",json!({"type":"function_call_output","call_id":"call","output":"/work/proj"})),
         codex_line(ts(5,5),"token_usage_record",usage),
     ]);
-    let mut query = home.query();
+    let mut query = activity_anchor_query(&home);
     call(&mut query, "get_session", json!({"id":"cx"}));
     let page = call(&mut query, "get_session_activity", json!({"id":"cx"}));
     let step = json!({"generation":page["generation"],"ordinal":0,"id":page["items"][0]["id"]});
