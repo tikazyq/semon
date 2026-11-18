@@ -1058,6 +1058,15 @@ impl Home {
         home
     }
 
+    fn remove_standalone_archive(&self) {
+        let path = crate::archive::standalone_dir(&self.options.cache);
+        match fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove test archive: {error}"),
+        }
+    }
+
     fn write(&self, relative: &str, content: &str) -> PathBuf {
         let path = self.root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2548,6 +2557,7 @@ fn native_owner_retirement_refuses_a_waiting_cold_read_and_keeps_a_warm_cohort()
     let warm = crate::native_evidence::NativeEvidence::new(home.options.clone());
     let retained = warm.query_at(NOW).unwrap();
     warm.retire();
+    home.remove_standalone_archive();
     fs::remove_file(home.root.join("claude/projects/-work-proj/lead.jsonl")).unwrap();
     assert!(Arc::ptr_eq(&retained, &warm.query_at(NOW).unwrap()));
     // Retaining metadata never permits serving removed source evidence.
@@ -2918,6 +2928,7 @@ fn local_query_conflicts_and_source_removal_use_native_snapshots() {
             "id_conflict"
         );
     }
+    second.remove_standalone_archive();
     fs::remove_file(
         second
             .root
@@ -5264,6 +5275,7 @@ fn catalog_query_rejects_retained_metadata_outside_configured_native_roots() {
     );
     let mut producer = Query::from_sources(admitted(home.options.clone()));
     producer.call_at("list_sessions", &json!({}), NOW).unwrap();
+    home.remove_standalone_archive();
     fs::remove_file(
         home.options
             .claude_home
@@ -5379,6 +5391,7 @@ fn catalog_search_admits_only_selected_archives_before_its_stop_boundary() {
             .call_optional_at("find", &args, NOW)
             .unwrap();
         let archive = Arc::new(selected_archive(&home, fault));
+        home.remove_standalone_archive();
         for id in ["lead", "unrelated"] {
             fs::remove_file(
                 home.options

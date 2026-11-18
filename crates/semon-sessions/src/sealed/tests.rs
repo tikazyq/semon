@@ -670,6 +670,7 @@ fn planted_seal_temporary_symlinks_never_truncate_the_target() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn deleted_sealed_native_log_reads_from_archive_and_keeps_custody() {
     let root = scratch("archived-sealed-native");

@@ -297,6 +297,17 @@ impl Home {
         home
     }
 
+    // Tests for missing evidence must remove the fixture's archive as well as
+    // its native file. This helper only operates inside the test's scratch home.
+    fn remove_standalone_archive(&self) {
+        let path = crate::archive::standalone_dir(&self.options.cache);
+        match fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not remove test archive: {error}"),
+        }
+    }
+
     fn write(&self, relative: &str, content: &str) -> PathBuf {
         let path = self.root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8682,6 +8693,7 @@ fn a_changed_session_reuses_other_sessions_with_stable_source_references() {
         .find_map(|slot| slot.file.as_ref())
         .unwrap();
     assert!(other.path.ends_with("other.jsonl"));
+    home.remove_standalone_archive();
     fs::remove_file(home.root.join("claude/projects/-work-proj/other.jsonl")).unwrap();
     build_with_cache(&home.options, &mut cache, &mut dirty, &mut texts, NOW);
     assert!(!texts.derived_sessions.contains_key("other"));
@@ -9817,6 +9829,7 @@ fn native_claude_copied_usage_keeps_observations_without_assigning_owner() {
     assert_eq!(fs::read_to_string(path).unwrap(), child);
     // Removing the counterpart changes ownership availability, never invents
     // lineage or remembers a now-unobservable original branch owner.
+    home.remove_standalone_archive();
     fs::remove_file(
         home.root
             .join("claude/projects/fixture/native-claude-child.jsonl"),
@@ -9891,6 +9904,7 @@ fn persisted_descriptions_reuse_restart_and_revalidate_changed_sources() {
         }
     }
 
+    home.remove_standalone_archive();
     fs::remove_file(home.root.join("claude/projects/-work-proj/other.jsonl")).unwrap();
     assert!(!home.build_query().sessions.contains_key("other"));
 }
@@ -10045,6 +10059,7 @@ fn catalog_observation_preserves_native_query_projections() {
     );
     assert_eq!(reply.status, 200);
     assert!(String::from_utf8_lossy(&reply.body).contains("new source answer"));
+    home.remove_standalone_archive();
     fs::remove_file(
         home.root
             .join("claude/projects/-work-proj/root/subagents/agent-child.jsonl"),
@@ -10178,6 +10193,7 @@ fn complete_catalog_is_untrimmed_stable_and_preserves_native_source_and_parent()
     assert_eq!(generation, read_catalog(&home).0);
     assert_eq!(read_catalog(&home).1.len(), 2);
 
+    home.remove_standalone_archive();
     fs::remove_file(
         home.root
             .join("claude/projects/-work-proj/root/subagents/agent-child.jsonl"),
@@ -10421,6 +10437,7 @@ fn partial_lineage_source_disappearance_preserves_natural_history_context() {
         crate::model::now_ms(),
     )
     .unwrap();
+    home.remove_standalone_archive();
     fs::remove_file(&removed.path).unwrap();
     let current = home.build_query();
     assert!(current.sessions.contains_key("root"));
@@ -10811,6 +10828,7 @@ fn partial_lineage_unsupported_recipes_remain_visible_and_block_eviction() {
             [],
         )
         .unwrap();
+    home.remove_standalone_archive();
     fs::remove_file(removed).unwrap();
     home.build_query();
     let history = crate::session_catalog_history_identity(&home.options, "fixture", "root")
@@ -10859,6 +10877,7 @@ fn source_disappearance_stays_pending_until_catalog_retirement_commits() {
         rusqlite::Connection::open(home.options.cache.with_extension("sqlite3")).unwrap();
     connection.execute_batch("CREATE TRIGGER interrupt_retirement BEFORE UPDATE OF lifecycle ON session_catalog WHEN NEW.lifecycle='retained' AND OLD.lifecycle='current' BEGIN SELECT RAISE(ABORT,'interrupted'); END;").unwrap();
     let source = home.root.join("claude/projects/-work-proj/root.jsonl");
+    home.remove_standalone_archive();
     fs::remove_file(&source).unwrap();
     let built = home.build_query();
     assert!(!built.sessions.contains_key("root"));
@@ -11084,6 +11103,7 @@ fn catalog_native_and_parent_indexes_keep_ambiguity_and_remove_retired_sources()
         "{parent_plan}"
     );
 
+    home.remove_standalone_archive();
     fs::remove_file(
         home.root
             .join("claude/projects/-work-proj/root/subagents/agent-child.jsonl"),
