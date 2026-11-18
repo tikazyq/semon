@@ -29,7 +29,7 @@ thread_local! {
     pub(crate) static LAST_LOCAL_FAILURE: std::cell::Cell<Option<crate::source_carrier::FailureStage>> = const { std::cell::Cell::new(None) };
 }
 
-fn reply(status: u16, value: Value) -> ViewerReply {
+pub(crate) fn reply(status: u16, value: Value) -> ViewerReply {
     ViewerReply {
         status,
         content_type: "application/json; charset=utf-8",

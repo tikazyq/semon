@@ -6333,6 +6333,286 @@ fn activity_fixture() -> Home {
     home
 }
 
+fn publish_activity_anchors(home: &Home) {
+    let mut cache = crate::events::EventCache::open_scoped(&home.options.cache).unwrap();
+    crate::model::observe_catalog(
+        &home.options,
+        &mut cache,
+        &mut false,
+        &mut crate::model::Texts::default(),
+        NOW,
+    )
+    .unwrap();
+}
+
+#[test]
+fn claude_activity_anchor_uses_exact_uuid_then_exact_usage_position() {
+    let home = Home::new("claude-anchor");
+    let mut first = assistant("anchor", ts(1, 1), vec![text("Exact UUID")]);
+    first["uuid"] = json!("first-record");
+    let mut update = assistant("anchor", ts(1, 2), vec![text("Last usage record")]);
+    update["message"]["id"] = first["message"]["id"].clone();
+    update["uuid"] = json!("last-record");
+    let fallback = assistant("anchor", ts(1, 3), vec![text("Exact usage position")]);
+    let mut hidden = assistant("anchor", ts(1, 4), vec![]);
+    hidden["uuid"] = json!("unrendered");
+    home.top(
+        "anchor",
+        &[
+            human("anchor", ts(1, 0), "Prompt"),
+            first,
+            update,
+            fallback,
+            hidden,
+        ],
+    );
+    publish_activity_anchors(&home);
+    let mut query = home.query();
+    let page = call(&mut query, "get_session_activity", json!({"id":"anchor"}));
+    let step = |ordinal: usize| json!({"generation":page["generation"],"ordinal":ordinal,"id":page["items"][ordinal]["id"]});
+    let first = step(0);
+    let transcript = call(
+        &mut query,
+        "read_transcript",
+        json!({"id":"anchor","step":first,"limit":1}),
+    );
+    assert_eq!(transcript["entries"][0]["text"], "Exact UUID");
+    let transcript = call(
+        &mut query,
+        "read_transcript",
+        json!({"id":"anchor","step":step(1),"limit":1}),
+    );
+    assert_eq!(transcript["entries"][0]["text"], "Exact usage position");
+    let err = query
+        .call_at(
+            "read_transcript",
+            &json!({"id":"anchor","step":step(2)}),
+            NOW,
+        )
+        .unwrap_err();
+    assert_eq!(err.reason, Some("no_exact_record"));
+    for argument in ["before", "after", "turn"] {
+        let mut args = json!({"id":"anchor","step":first});
+        args[argument] = if argument == "turn" {
+            json!("turn")
+        } else {
+            json!(0)
+        };
+        assert_eq!(
+            failure(&mut query, "read_transcript", args),
+            "invalid_arguments"
+        );
+    }
+    let core = crate::ViewerCore::new(home.options.clone());
+    let request = format!(
+        "machine=local&sid=anchor&generation={}&ordinal=0&id={}",
+        first["generation"].as_str().unwrap(),
+        crate::viewer::percent_encode(&first["id"].to_string())
+    );
+    let response = core.respond("GET", "/api/session-activity-anchor", &request, None);
+    assert_eq!(response.status, 200);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["available"], true);
+    assert_eq!(body["slot"], 1);
+    assert_eq!(body["basis"], "claude_record_id");
+    assert_eq!(body["step"], json!({"ordinal":0,"id":first["id"]}));
+    assert_eq!(body["activity_generation"], first["generation"]);
+    assert!(body["source_generation"].is_string());
+    assert!(body["transcript_generation"].is_string());
+    assert_eq!(body.as_object().unwrap().len(), 7);
+    let response = core.respond(
+        "GET",
+        "/api/session-activity-anchor",
+        &format!("{request}&ordinal=0"),
+        None,
+    );
+    assert_eq!(response.status, 400);
+}
+
+#[test]
+fn activity_anchor_rejects_stale_and_incomplete_projections() {
+    use crate::activity_anchor::{Refusal, Step, resolve};
+    let home = activity_fixture();
+    publish_activity_anchors(&home);
+    let page = call(
+        &mut home.query(),
+        "get_session_activity",
+        json!({"id":"activity"}),
+    );
+    let step = Step::parse(
+        json!({"generation":page["generation"],"ordinal":0,"id":page["items"][0]["id"]}),
+    )
+    .unwrap();
+    let mut db =
+        rusqlite::Connection::open(crate::events::EventCache::path(&home.options.cache)).unwrap();
+    let tx = db.transaction().unwrap();
+    let sources: String = tx.query_row("SELECT source_generation FROM session_activity_projections WHERE session_key='activity'", [], |row| row.get(0)).unwrap();
+    let price = crate::pricing::snapshot();
+    let resolve = |history, step: &Step, price: &str| {
+        resolve(&tx, "activity", &sources, history, step, price).unwrap()
+    };
+    assert!(resolve(false, &step, &price.fingerprint).is_ok());
+    tx.execute_batch("SAVEPOINT record_cap").unwrap();
+    let ids: Vec<String> = (0..257).map(|i| format!("record-{i}")).collect();
+    tx.execute(
+        "UPDATE session_activity_steps SET metadata=json_set(metadata,'$.usage.Claude.record_ids',json(?1))
+         WHERE session_key='activity' AND ordinal=0",
+        [json!(ids).to_string()],
+    ).unwrap();
+    assert_eq!(
+        resolve(false, &step, &price.fingerprint).unwrap_err(),
+        Refusal::NoExactRecord
+    );
+    tx.execute_batch("ROLLBACK TO record_cap; RELEASE record_cap")
+        .unwrap();
+    let stale = Step {
+        generation: "stale".into(),
+        ordinal: step.ordinal,
+        id: step.id.clone(),
+    };
+    assert_eq!(
+        resolve(false, &stale, &price.fingerprint).unwrap_err(),
+        Refusal::StaleActivity
+    );
+    let wrong = Step {
+        generation: step.generation.clone(),
+        ordinal: step.ordinal,
+        id: crate::events::session_activity::ActivityStepId::Claude("wrong".into()),
+    };
+    assert_eq!(
+        resolve(false, &wrong, &price.fingerprint).unwrap_err(),
+        Refusal::StaleActivity
+    );
+    assert_eq!(
+        resolve(false, &step, "old-price").unwrap_err(),
+        Refusal::StaleActivity
+    );
+    assert_eq!(
+        resolve(true, &step, &price.fingerprint).unwrap_err(),
+        Refusal::StaleTranscript
+    );
+    tx.execute("INSERT INTO session_history_projections(session_key,generation,version,total,source_generation,incomplete) SELECT session_key,generation,version,total,source_generation,1 FROM session_slot_projections WHERE session_key='activity'", []).unwrap();
+    assert_eq!(
+        resolve(true, &step, &price.fingerprint).unwrap_err(),
+        Refusal::HistoryIncomplete
+    );
+    tx.execute("UPDATE session_slot_projections SET source_generation='other' WHERE session_key='activity'", []).unwrap();
+    assert_eq!(
+        resolve(false, &step, &price.fingerprint).unwrap_err(),
+        Refusal::SourceGenerationMismatch
+    );
+    tx.execute(
+        "UPDATE session_slot_projections SET version=0 WHERE session_key='activity'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        resolve(false, &step, &price.fingerprint).unwrap_err(),
+        Refusal::StaleTranscript
+    );
+    tx.execute(
+        "UPDATE session_activity_projections SET rules_version=8 WHERE session_key='activity'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        resolve(false, &step, &price.fingerprint).unwrap_err(),
+        Refusal::StaleActivity
+    );
+
+    let query = &mut home.query();
+    let err = query.read_transcript(&json!({"id":"activity","step":{"generation":step.generation,"ordinal":step.ordinal,"id":step.id}}), NOW, None).unwrap_err();
+    assert_eq!(err.reason, Some("unsupported_storage"));
+}
+
+#[test]
+fn codex_activity_anchor_uses_the_full_response_tuple_and_parent_call() {
+    let home = Home::new("codex-anchor");
+    let with_identity = |mut payload: Value, thread: &str, response: &str| {
+        payload["thread_id"] = json!(thread);
+        payload["session_id"] = json!("anchor");
+        payload["turn_id"] = json!("turn");
+        payload["response_id"] = json!(response);
+        payload
+    };
+    let usage = |minute, response| {
+        codex_line(
+            ts(1, minute),
+            "token_usage_record",
+            with_identity(
+                json!({"usage":{"input_tokens":31,"output_tokens":7,"total_tokens":38,"cached_input_tokens":0,"cache_write_input_tokens":0,"reasoning_output_tokens":0}}),
+                "anchor",
+                response,
+            ),
+        )
+    };
+    home.lines("codex/sessions/rollout-anchor.jsonl", &[
+        codex_line(ts(1,0),"session_meta",json!({"id":"anchor","cwd":"/synthetic"})),
+        codex_line(ts(1,0),"turn_context",json!({"model":"gpt-test"})),
+        codex_line(ts(1,0),"event_msg",json!({"type":"user_message","message":"Prompt"})),
+        codex_line(ts(1,1),"response_item",with_identity(json!({"type":"function_call","name":"wrong","call_id":"wrong","arguments":"{}"}),"other","direct")),
+        codex_line(ts(1,2),"response_item",with_identity(json!({"type":"function_call","name":"exact","call_id":"exact","arguments":"{}"}),"anchor","direct")),
+        codex_line(ts(1,2),"response_item",with_identity(json!({"type":"function_call","name":"later","call_id":"later","arguments":"{}"}),"anchor","direct")),
+        usage(3,"direct"),
+        codex_line(ts(1,4),"response_item",with_identity(json!({"type":"custom_tool_call","name":"exec","call_id":"parent","input":""}),"anchor","script")),
+        codex_line(ts(1,5),"event_msg",json!({"type":"item_completed","item":{"type":"CommandExecution","id":"operation","exit_code":0}})),
+        codex_line(ts(1,6),"response_item",json!({"type":"custom_tool_call_output","call_id":"parent","output":"done"})),
+        usage(7,"script"),
+        codex_line(ts(1,8),"response_item",with_identity(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Only text"}]}),"anchor","text")),
+        usage(9,"text"),
+    ]);
+    publish_activity_anchors(&home);
+    let page = call(
+        &mut home.query(),
+        "get_session_activity",
+        json!({"id":"anchor"}),
+    );
+    let mut db =
+        rusqlite::Connection::open(crate::events::EventCache::path(&home.options.cache)).unwrap();
+    let tx = db.transaction().unwrap();
+    let sources: String = tx
+        .query_row(
+            "SELECT source_generation FROM session_activity_projections WHERE session_key='anchor'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let price = crate::pricing::snapshot();
+    for (ordinal, response) in ["direct", "script", "text"].into_iter().enumerate() {
+        let step = crate::activity_anchor::Step::parse(json!({"generation":page["generation"],"ordinal":ordinal,"id":{"Codex":["anchor","anchor","turn",response]}})).unwrap();
+        let result = crate::activity_anchor::resolve(
+            &tx,
+            "anchor",
+            &sources,
+            false,
+            &step,
+            &price.fingerprint,
+        )
+        .unwrap();
+        if response == "text" {
+            assert_eq!(
+                result.unwrap_err(),
+                crate::activity_anchor::Refusal::NoExactRecord
+            );
+        } else {
+            let anchor = result.unwrap();
+            let metadata: String = tx
+                .query_row(
+                    "SELECT metadata FROM session_slots WHERE session_key='anchor' AND slot=?1",
+                    [anchor.slot as i64],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let metadata: Value = serde_json::from_str(&metadata).unwrap();
+            if response == "direct" {
+                assert_eq!(metadata["recipe"]["name"], "exact");
+            } else {
+                assert_eq!(metadata["recipe"]["recipe"], "Operation");
+            }
+        }
+    }
+}
+
 #[test]
 fn activity_analytics_is_additive_and_preserves_unknown_cost_and_duration() {
     let home = activity_fixture();

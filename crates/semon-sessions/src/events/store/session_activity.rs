@@ -310,6 +310,53 @@ pub(crate) fn page(
     }))
 }
 
+pub(crate) fn anchor_evidence(
+    tx: &Transaction<'_>,
+    key: &str,
+    sources: &str,
+    step: &crate::activity_anchor::Step,
+    price: &str,
+) -> rusqlite::Result<Result<(SourcePosition, Usage), crate::activity_anchor::Refusal>> {
+    use crate::activity_anchor::Refusal;
+    let header: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT source_generation,total FROM session_activity_projections
+         WHERE session_key=?1 AND generation=?2 AND rules_version=?3 AND pricing_fingerprint=?4",
+            params![
+                key,
+                step.generation,
+                activity::ACTIVITY_RULES_VERSION,
+                price
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((source_generation, total)) = header else {
+        return Ok(Err(Refusal::StaleActivity));
+    };
+    if source_generation != sources {
+        return Ok(Err(Refusal::SourceGenerationMismatch));
+    }
+    if !(0..total).contains(&step.ordinal) {
+        return Ok(Err(Refusal::StaleActivity));
+    }
+    let saved = tx
+        .query_row(
+            "SELECT metadata FROM session_activity_steps
+         WHERE session_key=?1 AND generation=?2 AND ordinal=?3 AND pricing_fingerprint=?4",
+            params![key, step.generation, step.ordinal, price],
+            |row| {
+                crate::selected_read::row(row, 256)?;
+                from_json::<SavedStep>(0, &row.get::<_, String>(0)?)
+            },
+        )
+        .optional()?;
+    Ok(match saved {
+        Some(saved) if saved.step.id == step.id => Ok((saved.step.position, saved.usage)),
+        _ => Err(Refusal::StaleActivity),
+    })
+}
+
 /// The bounded timeline stored with the projection, under the same source,
 /// rules, price and generation admission as the step pages.
 pub(crate) fn preview(

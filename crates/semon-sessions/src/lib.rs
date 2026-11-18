@@ -57,6 +57,7 @@ pub(crate) use session_bookmark::session_bookmark_with_gate;
 mod claude_usage;
 pub mod copilot;
 pub use claude_usage::ClaudeUsageEvidence;
+mod activity_anchor;
 mod attachments;
 pub mod comparison;
 mod events;

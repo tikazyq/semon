@@ -335,7 +335,7 @@ fn retained_query_tools() -> Vec<QueryTool> {
             name: "read_transcript",
             description: "A page of one session's transcript, the same page the viewer's /api/tx serves: entries \
                 with from and to (their positions) and total. With no anchor, the last page; before or after a \
-                position; or the page starting at a turn. Tool input and output are previews.",
+                position; or the page starting at a turn or an exact activity step. Use only one anchor. Tool input and output are previews.",
             positional: Some("id"),
             input_schema: json!({
                 "type": "object",
@@ -344,6 +344,21 @@ fn retained_query_tools() -> Vec<QueryTool> {
                     "before": {"type": "integer", "minimum": 0, "description": "The page ending before this position (a page's from)."},
                     "after": {"type": "integer", "minimum": 0, "description": "The page starting at this position (a page's to)."},
                     "turn": {"type": "string", "minLength": 1, "description": "The page starting at this turn's first entry."},
+                    "step": {
+                        "type": "object", "required": ["generation", "ordinal", "id"], "additionalProperties": false,
+                        "description": "Start at the exact transcript entry for a generation-qualified activity step (SQLite only).",
+                        "properties": {
+                            "generation": {"type": "string", "minLength": 1, "maxLength": 128},
+                            "ordinal": {"type": "integer", "minimum": 0},
+                            "id": {"type": "object", "additionalProperties": false,
+                                "oneOf": [{"required": ["Claude"]}, {"required": ["Codex"]}],
+                                "properties": {
+                                    "Claude": {"type": "string", "minLength": 1},
+                                    "Codex": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "string", "minLength": 1}}
+                                }
+                            }
+                        }
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": tx::PAGE_ENTRIES, "default": tx::PAGE_ENTRIES, "description": "At most this many entries."},
                 },
                 "required": ["id"],
@@ -876,6 +891,21 @@ fn validate_tool_call(tools: &[QueryTool], tool: &str, args: &Value) -> Result<(
     let empty = json!({});
     let args = if args.is_null() { &empty } else { args };
     validate(&spec.input_schema, args)?;
+    if tool == "read_transcript" && !args["step"].is_null() {
+        if crate::activity_anchor::Step::parse(args["step"].clone()).is_none() {
+            return Err(QueryError::invalid(
+                "step requires a generation, ordinal and native activity id",
+            ));
+        }
+        if ["before", "after", "turn"]
+            .iter()
+            .any(|name| !args[*name].is_null())
+        {
+            return Err(QueryError::invalid(
+                "before, after, turn and step are exclusive",
+            ));
+        }
+    }
     since_ms(args, now_ms())?;
     Ok(())
 }
@@ -916,6 +946,20 @@ mod activity;
 pub(crate) mod catalog;
 mod search;
 mod transcript;
+
+fn step_anchor_error(reason: crate::activity_anchor::Refusal) -> QueryError {
+    QueryError {
+        reason: Some(reason.reason()),
+        ..QueryError::new(
+            if reason == crate::activity_anchor::Refusal::UnsupportedStorage {
+                "capability_unavailable"
+            } else {
+                "stale_projection"
+            },
+            "An exact activity step anchor is unavailable",
+        )
+    }
+}
 
 impl Query {
     /// The tools over the agent homes, `/proc` and cache `options` name.
@@ -1059,6 +1103,11 @@ impl Query {
             .machines
             .iter()
             .any(|(_, source)| source.storage.is_postgres());
+        if postgres && tool == "read_transcript" && !args["step"].is_null() {
+            return Err(step_anchor_error(
+                crate::activity_anchor::Refusal::UnsupportedStorage,
+            ));
+        }
         if postgres && tool == "get_session_activity" {
             return Err(QueryError::new(
                 "capability_unavailable",
@@ -1348,6 +1397,11 @@ impl Query {
         if self.sources.is_retired() {
             return Err(QueryError::new("io", "native query source is closed"));
         }
+        if evidence.storage.is_postgres() && tool == "read_transcript" && !args["step"].is_null() {
+            return Err(step_anchor_error(
+                crate::activity_anchor::Refusal::UnsupportedStorage,
+            ));
+        }
         if evidence.storage.is_postgres() && tool == "get_session_activity" {
             return Err(QueryError::new(
                 "capability_unavailable",
@@ -1454,6 +1508,11 @@ impl Query {
             }
             answer["window_start"] = json!(self.start);
             return Ok(answer);
+        }
+        if tool == "read_transcript" && !args["step"].is_null() {
+            return Err(step_anchor_error(
+                crate::activity_anchor::Refusal::UnsupportedStorage,
+            ));
         }
         let result = evidence
             .storage
@@ -1637,6 +1696,11 @@ impl Query {
     ) -> Result<Value, QueryError> {
         let id = string(args, "id").unwrap_or_default();
         let position = |key: &str| integer(args, key).map(|value| value.max(0) as usize);
+        if !args["step"].is_null() {
+            return Err(step_anchor_error(
+                crate::activity_anchor::Refusal::UnsupportedStorage,
+            ));
+        }
         let anchor = tx::Anchor::of(position("before"), position("after"), string(args, "turn"))
             .ok_or_else(|| QueryError::invalid("before, after and turn are exclusive"))?;
         let limit = integer(args, "limit").map_or(tx::PAGE_ENTRIES, |limit| limit as usize);

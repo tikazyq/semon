@@ -410,3 +410,26 @@ can only qualify against its own exact source vector; a different history cohort
 is unavailable. Preserve the source and custody contracts in
 [retained native projections](retained-native-projections.md) and
 [native session source readers](session-source-reader.md).
+
+### Rules version 9: exact transcript anchors
+
+Resolve an anchor on demand in one selected SQLite snapshot using the activity
+generation, zero-based ordinal and native step ID. The activity header must
+match the current rules and price fingerprint. The activity and complete
+transcript headers must agree with the selected source generation.
+
+Claude uses the lowest assistant-authored slot with a UUID in the stored usage
+record IDs (`claude_record_id`). If there is no UUID match, it can use the exact
+assistant usage record at the stored path and byte offset (`claude_usage_record`).
+Messages with more than 256 record IDs are ineligible. Codex uses the lowest
+rendered slot backed by a tool-call record carrying the full thread, session,
+turn and response tuple (`codex_tool_call`). A code-mode operation uses evidence
+from its parent call and returns the rendered operation slot. Text-only Codex
+responses and steps without a rendered exact record have no anchor.
+
+Success returns `available: true`, `activity_generation`, `step: {ordinal, id}`,
+`source_generation`, `transcript_generation`, `slot`, and `basis`. Refusal returns
+`available: false` and `reason`, one of `stale_activity`, `stale_transcript`,
+`source_generation_mismatch`, `history_incomplete`, `no_exact_record`, and
+`unsupported_storage`. Native source paths and internal call positions stay
+private.

@@ -606,8 +606,23 @@ fn check_schema(tool: &str, schema: &Value) {
     assert_eq!(schema["type"], "object", "{tool}");
     assert_eq!(schema["additionalProperties"], false, "{tool}");
     let properties = schema["properties"].as_object().unwrap();
+    if tool == "read_transcript" {
+        assert!(properties.contains_key("step"));
+    }
     assert!(!properties.is_empty(), "{tool}");
     for (name, property) in properties {
+        if (tool, name.as_str()) == ("read_transcript", "step") {
+            assert_eq!(property["type"], "object");
+            assert_eq!(property["required"], json!(["generation", "ordinal", "id"]));
+            assert_eq!(property["additionalProperties"], false);
+            assert_eq!(property["properties"]["generation"]["type"], "string");
+            assert_eq!(property["properties"]["ordinal"]["minimum"], 0);
+            let id = &property["properties"]["id"];
+            assert_eq!(id["properties"]["Claude"]["type"], "string");
+            assert_eq!(id["properties"]["Codex"]["minItems"], 4);
+            assert_eq!(id["properties"]["Codex"]["maxItems"], 4);
+            continue;
+        }
         let property = property.as_object().unwrap();
         for key in property.keys() {
             assert!(

@@ -263,6 +263,13 @@ pub(crate) enum Recipe {
     NoActivity,
 }
 
+/// Native evidence used only to resolve activity anchors to rendered slots.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum ActivityRecord {
+    Claude(Option<String>),
+    Codex([String; 4]),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SavedSlot {
@@ -277,6 +284,8 @@ pub(crate) struct SavedSlot {
     pub(crate) field: Option<crate::native_field::NativeField>,
     #[serde(default)]
     pub(crate) native_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) activity_record: Option<ActivityRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) images: Vec<serde_json::Value>,
 }
@@ -428,6 +437,7 @@ impl SavedSlot {
             return Self {
                 images: previous.images.clone(),
                 native_event_id: previous.native_event_id.clone(),
+                activity_record: previous.activity_record.clone(),
                 field: previous.field.clone(),
                 recipe,
                 file,
@@ -491,6 +501,53 @@ impl SavedSlot {
                     .filter(|value| !value.is_empty() && value.len() <= 4096)
                     .map(str::to_owned)
             });
+        let activity_record = (|| {
+            let at = match &recipe {
+                Recipe::Operation { script_offset, .. } => (*script_offset)?,
+                Recipe::A
+                | Recipe::Think
+                | Recipe::Tool { .. }
+                | Recipe::Yielded { .. }
+                | Recipe::Sent { .. } => slot.offset,
+                _ => return None,
+            };
+            let loaded;
+            let record = if let Some(record) = native_record.as_ref().filter(|_| at == slot.offset)
+            {
+                record
+            } else {
+                let file = slot.file.as_ref()?;
+                let bytes = if let Some(history) = history {
+                    history.record_bytes(&file.path, at)?
+                } else {
+                    crate::native_field::read_source_record(sources.get(&file.path)?, at, records)?
+                };
+                loaded = crate::tx::parse_native_record(&bytes)?;
+                &loaded
+            };
+            if record["type"] == "assistant" && !matches!(recipe, Recipe::Operation { .. }) {
+                let uuid = record["uuid"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 4096);
+                return Some(ActivityRecord::Claude(uuid.map(str::to_owned)));
+            }
+            let payload = record.get("payload")?;
+            if record["type"] == "response_item"
+                && matches!(
+                    payload["type"].as_str(),
+                    Some(
+                        "function_call"
+                            | "custom_tool_call"
+                            | "local_shell_call"
+                            | "tool_search_call"
+                    )
+                )
+            {
+                let identity = crate::events::codex_response_identity(payload)?;
+                return Some(ActivityRecord::Codex(identity.map(str::to_owned)));
+            }
+            None
+        })();
         let mut images = if matches!(&slot.kind, SlotKind::U | SlotKind::H(_)) {
             slot.file
                 .as_ref()
@@ -509,6 +566,7 @@ impl SavedSlot {
         }
         Self {
             native_event_id,
+            activity_record,
             images,
             field,
             recipe,

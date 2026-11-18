@@ -88,7 +88,17 @@ Event Index or preparing a semantic cohort. Catalog publishes exact call/error
 counts and pending/background observations under its source/runtime fence;
 recipes themselves grant no live authority. The shared renderer keeps original
 slot addresses and the preceding Thinking timestamp. Turn anchors use the
-existing selected-session turn indexes. Completion rechecks the selected row,
+existing selected-session turn indexes. `read_transcript` accepts a fourth anchor,
+`step: {generation, ordinal, id}`, exclusive with `before`, `after`, and `turn`.
+Use the generation and native step ID returned by `get_session_activity` and the
+zero-based ordinal in its step stream. The CLI accepts the object as JSON in
+`--step`. The focused SQLite read resolves the slot in its selection snapshot
+and starts the page there. The in-memory and PostgreSQL paths refuse with
+`error.reason: "unsupported_storage"`. Other anchor refusals are `stale_activity`,
+`stale_transcript`, `source_generation_mismatch`, `history_incomplete`, and
+`no_exact_record`.
+
+Completion rechecks the selected row,
 slot generation, touched sources and runtime, permitting unrelated publication.
 Recipe windows stop at 512 candidates plus one preceding context row; selected
 recipe metadata and content-free proof hashes each have a 4 MiB read budget.

@@ -94,7 +94,7 @@ pub(crate) fn set_claude_sidecar_hook(hook: impl FnOnce() + 'static) {
 /// v38: activity steps carry independently priced dollar components; the
 /// compact activity summary adds coverage and component totals, and the
 /// projection stores a bounded timeline preview beside it.
-pub(crate) const CACHE_VERSION: u32 = 38;
+pub(crate) const CACHE_VERSION: u32 = 39;
 
 /// The four token categories the model serves for an exact model id.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +168,17 @@ pub(crate) struct CodexNativeUsage {
     cost: Option<crate::pricing::CostBuild>,
 }
 
+/// Exact identity carried by a native Codex response record.
+pub(crate) fn codex_response_identity(payload: &Value) -> Option<[&str; 4]> {
+    let [Some(thread), Some(session), Some(turn), Some(response)] =
+        ["thread_id", "session_id", "turn_id", "response_id"]
+            .map(|key| field(payload, key).filter(|id| !id.is_empty()))
+    else {
+        return None;
+    };
+    Some([thread, session, turn, response])
+}
+
 impl CodexNativeUsage {
     pub(crate) fn tokens(&self) -> Tokens {
         self.tokens.clone()
@@ -218,11 +229,7 @@ impl CodexNativeUsage {
     /// Shared validation for indexing and receipt-checked representation migration.
     pub(crate) fn decode(payload: &Value) -> Option<(String, Tokens, ModelTokens)> {
         let usage = payload.get("usage")?;
-        let identity =
-            ["thread_id", "session_id", "turn_id", "response_id"].map(|key| field(payload, key));
-        if identity.iter().any(|id| id.is_none_or(str::is_empty)) {
-            return None;
-        }
+        let identity = codex_response_identity(payload)?;
         let [
             Some(input),
             Some(output),

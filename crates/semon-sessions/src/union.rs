@@ -1185,6 +1185,7 @@ impl ViewerCore {
                 | "/api/session-capabilities"
                 | "/api/session-identity"
                 | "/api/session-anchor"
+                | "/api/session-activity-anchor"
                 | "/api/session-annotations"
                 | "/api/session-trace"
                 | "/api/session-home"
@@ -1464,6 +1465,15 @@ impl ViewerCore {
         } else {
             key.as_str()
         };
+        if path == "/api/session-activity-anchor" {
+            return crate::activity_anchor::viewer_reply(
+                &view.evidence.storage,
+                view.options(),
+                key,
+                query,
+                || wait_for_catalog_read(view, deadline, allow_catalog_wait).map(|_| ()),
+            );
+        }
         #[cfg(feature = "postgres")]
         if view.evidence.storage.is_postgres() {
             if let Err(reply) = wait_for_catalog_read(view, deadline, allow_catalog_wait) {

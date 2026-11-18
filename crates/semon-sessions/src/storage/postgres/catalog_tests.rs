@@ -70,6 +70,7 @@ async fn observation(
             first: false,
             field: None,
             native_event_id: None,
+            activity_record: None,
             images: Vec::new(),
         })
         .collect();

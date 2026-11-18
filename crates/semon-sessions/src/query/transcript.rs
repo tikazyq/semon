@@ -675,7 +675,13 @@ fn read_inner(
         )
         .optional()
         .map_err(unavailable)?;
+    let step = crate::activity_anchor::Step::parse(args["step"].clone());
     if projection_generation.as_deref() != Some(&catalog_generation) {
+        if step.is_some() {
+            return Err(step_anchor_error(
+                crate::activity_anchor::Refusal::StaleTranscript,
+            ));
+        }
         return Ok(None);
     }
     let history = crate::history_projection::catalog(&tx, key).map_err(unavailable)?;
@@ -685,6 +691,11 @@ fn read_inner(
             .optional().map_err(unavailable)?.flatten(),
     };
     let Some(text) = text else {
+        if step.is_some() {
+            return Err(step_anchor_error(
+                crate::activity_anchor::Refusal::UnsupportedStorage,
+            ));
+        }
         tx.commit().map_err(unavailable)?;
         return virtual_read(options, key, args, provider, mode, now);
     };
@@ -745,6 +756,23 @@ fn read_inner(
     } else {
         ("session_slot_projections", "session_slots")
     };
+    let expected_sources =
+        crate::retention::source_generation(&row.sources).map_err(unavailable)?;
+    let step_anchor = step
+        .as_ref()
+        .map(|step| {
+            crate::activity_anchor::resolve(
+                &tx,
+                key,
+                &expected_sources,
+                history.is_some(),
+                step,
+                &crate::pricing::snapshot().fingerprint,
+            )
+            .map_err(unavailable)?
+            .map_err(step_anchor_error)
+        })
+        .transpose()?;
     let header: Option<(String,u32,i64,Option<String>)> = tx.query_row(&format!(
         "SELECT generation,version,total,source_generation FROM {headers} WHERE session_key=?1"
     ), [key], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(unavailable)?;
@@ -760,15 +788,16 @@ fn read_inner(
         error.stage = Some("header-version");
         return Err(error);
     }
-    if source_generation.as_deref()
-        != Some(&crate::retention::source_generation(&row.sources).map_err(unavailable)?)
-    {
+    if source_generation.as_deref() != Some(expected_sources.as_str()) {
         return Err(unavailable("Native transcript source generation changed"));
     }
     let position = |name: &str| integer(args, name).map(|value| value.max(0) as usize);
     let anchor = tx::Anchor::of(position("before"), position("after"), string(args, "turn"))
         .ok_or_else(|| QueryError::invalid("before, after and turn are exclusive"))?;
     let (forward, from) = match &anchor {
+        tx::Anchor::Last if step_anchor.is_some() => {
+            (true, step_anchor.expect("step resolved").slot)
+        }
         tx::Anchor::Last => (false, total),
         tx::Anchor::Before(before) => (false, (*before).min(total)),
         tx::Anchor::After(after) => (true, (*after).min(total)),

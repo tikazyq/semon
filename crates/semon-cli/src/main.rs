@@ -255,6 +255,9 @@ fn parse_query_args(mut arguments: impl Iterator<Item = String>) -> Result<Query
                         raw.parse::<i64>()
                             .map_err(|_| format!("{flag} expects an integer, got {raw}"))?,
                     )
+                } else if property["type"] == "object" {
+                    serde_json::from_str(&raw)
+                        .map_err(|error| format!("{flag} expects a JSON object: {error}"))?
                 } else {
                     serde_json::Value::String(raw)
                 };

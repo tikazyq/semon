@@ -240,6 +240,34 @@ pub(super) fn lifecycle(dsn: &str) {
             .code,
         "capability_unavailable"
     );
+    let step =
+        json!({"generation":"activity","ordinal":0,"id":{"Codex":[key,key,"turn","response"]}});
+    let error = query
+        .call_selected(
+            "injected-runtime",
+            key,
+            "read_transcript",
+            &json!({"id":key,"step":step}),
+            None,
+            crate::SessionSourceReadMode::LocalOrPinnedProvider,
+        )
+        .unwrap_err();
+    assert_eq!(error.reason, Some("unsupported_storage"));
+    let response = core.respond(
+        "GET",
+        "/api/session-activity-anchor",
+        &format!(
+            "machine=injected-runtime&sid={}&generation=activity&ordinal=0&id={}",
+            crate::viewer::percent_encode(key),
+            crate::viewer::percent_encode(&step["id"].to_string())
+        ),
+        None,
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.body).unwrap(),
+        json!({"available":false,"reason":"unsupported_storage"})
+    );
     // A foreign source key cannot use this app-owned capability, even if the
     // same native paths exist. Lower-level conformance proves forced-RLS SQL.
     let foreign = evidence.storage.page(
