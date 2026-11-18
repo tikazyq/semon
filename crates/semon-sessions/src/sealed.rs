@@ -497,7 +497,7 @@ struct Loaded {
 /// or not, at the offsets of the plain file. See the module docs.
 pub struct LogFile {
     file: fs::File,
-    dir: PathBuf,
+    dir: Option<PathBuf>,
     birth: Birth,
     pos: u64,
     seal: Option<Loaded>,
@@ -508,19 +508,28 @@ pub struct LogFile {
 impl LogFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = crate::open_input(path)?;
+        let dir = seal_dir(path);
+        let mut log = Self::with_file(file, Some(dir.clone()))?;
+        // A manifest that can't be read yet counts as none: the sealed range
+        // reads as NULs, which reads it again and fails then.
+        log.install(read_manifest(&dir).ok().flatten());
+        Ok(log)
+    }
+
+    pub(crate) fn from_archive(file: fs::File) -> io::Result<Self> {
+        Self::with_file(file, None)
+    }
+
+    fn with_file(file: fs::File, dir: Option<PathBuf>) -> io::Result<Self> {
         let birth = Birth::of(&file.metadata()?);
-        let mut log = Self {
+        Ok(Self {
             file,
-            dir: seal_dir(path),
+            dir,
             birth,
             pos: 0,
             seal: None,
             frame: None,
-        };
-        // A manifest that can't be read yet counts as none: the sealed range
-        // reads as NULs, which reads it again and fails then.
-        log.install(read_manifest(&log.dir).ok().flatten());
-        Ok(log)
+        })
     }
 
     /// The plain file's metadata: the log's length, inode and modified time.
@@ -542,7 +551,7 @@ impl LogFile {
     /// Reads the manifest again, on a NUL hint; returns whether it
     /// changed. One that is there but can't be read is an error.
     fn refresh(&mut self) -> io::Result<bool> {
-        let read = read_manifest(&self.dir)?;
+        let read = read_manifest(self.dir.as_deref().expect("native seal directory"))?;
         let same = match (&read, &self.seal) {
             (None, None) => true,
             (Some(manifest), Some(loaded)) => *manifest == loaded.manifest,
@@ -568,8 +577,11 @@ impl LogFile {
             .get(index)
             .ok_or_else(|| invalid("past the sealed range"))?;
         if seal.segments[index].is_none() {
-            seal.segments[index] =
-                Some(open_segment(&self.dir, &seal.manifest.generation, segment)?);
+            seal.segments[index] = Some(open_segment(
+                self.dir.as_deref().expect("native seal directory"),
+                &seal.manifest.generation,
+                segment,
+            )?);
         }
         let open = seal.segments[index].as_ref().expect("opened above");
         let within = at - segment.start;
@@ -653,7 +665,7 @@ impl Read for LogFile {
                 return Ok(count);
             }
             let count = read_at(&self.file, buf, self.pos)?;
-            if count > 0 && buf[..count].contains(&0) {
+            if self.dir.is_some() && count > 0 && buf[..count].contains(&0) {
                 // A seal may have punched these bytes after the manifest
                 // was last read.
                 if !reloaded {
@@ -978,6 +990,17 @@ fn read_custody(dir: &Path) -> io::Result<Option<Custody>> {
     Ok(serde_json::from_slice(&bytes).ok())
 }
 
+/// A certificate is also a retention witness even when the log is absent.
+pub(crate) fn custody_chain(
+    log: &Path,
+    archive: &Path,
+    source: &str,
+) -> io::Result<Option<String>> {
+    Ok(read_custody(&seal_dir(log))?
+        .filter(|held| held.archive == archive && held.source == source)
+        .map(|held| held.chain.chain_id))
+}
+
 /// Records, durably, that an archive chain holds the first `covered` bytes
 /// of `log` as it reads through [`LogFile`]: the whole log, which must be
 /// `covered` bytes long still. Until then a seal's segments are never
@@ -1010,7 +1033,7 @@ pub fn record_custody(
     {
         return Ok(false);
     }
-    archive.with_verified_chain(source, chain, |bytes| {
+    archive.pin_seal(source, chain, |bytes| {
         compare_segments(&dir, &manifest, bytes)
     })?;
     let temporary = temporary_path(&dir, CUSTODY);

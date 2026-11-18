@@ -115,11 +115,22 @@ solo. A native `subagent` kind independently establishes worker status.
 ## Raw
 
 Raw remains at the origin under native custody. The standalone archiver keeps
-an append-only zstd copy of each native log under `archive/`, admitting only the
-prefix index has consumed. A rewrite starts a new chain and preserves the old
-one; index can read archived sources when native logs are gone. Existing origin
-retention is unchanged: indefinite by default, with optional
-`archive.retention_days`; native logs are never deleted by this design.
+an append-only zstd copy of each native log under `archive/`, admitting the
+prefix consumed by the Event Index. A rewrite starts a new chain and preserves
+the previous one. Each standalone manifest binds the configured native root,
+relative path, native ID, original ledger, any Claude sidecar observation, and
+exact chain. The index can replay a verified complete chain when its native log
+is missing. Bounded checkpoints and unconsumed EOF suffixes do not qualify a
+chain for replay.
+
+`archive.retention_days` defaults to indefinite. Set it for a single run with
+`semon archive prune --retention-days N [--cache PATH]`. Without the flag the
+command reports that it deleted nothing. Age starts at the chain's immutable
+admission time. Extending the chain does not renew it. The cutoff is strict:
+chains exactly N days old stay. An index retention marker (version 7) or a
+seal's `custody.json` protects a chain regardless of age. The command may keep
+additional chains for the same source. Pruning touches only archive objects and
+manifests. Unsupported manifests block deletion and are never migrated.
 
 An opt-in replica follows supported mirror and #572 custody, including preserving
 replaced bytes and redaction provenance. Before acknowledging `replace`, preserve

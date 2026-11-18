@@ -151,7 +151,7 @@ fn a_digest_mismatch_is_detected() {
     let (_scratch, archive) = self::archive();
     preserve(&archive, "s", &lines(50_000, 1), "1").unwrap();
     let path = manifest_path(&archive, "s");
-    let mut manifest: Manifest = read_json(&path).unwrap();
+    let mut manifest: Manifest = read_json(&path).unwrap().unwrap();
     manifest.chains[0].sha256 = hex(&digest(b"not these"));
     publish(path.parent().unwrap(), MANIFEST, &manifest).unwrap();
     assert!(archive.verify("s").is_err());
@@ -319,7 +319,7 @@ fn a_manifest_that_names_a_path_outside_the_archive_is_refused() {
     fs::write(&outside, b"keep").unwrap();
 
     let path = manifest_path(&archive, "native");
-    let mut manifest: Manifest = read_json(&path).unwrap();
+    let mut manifest: Manifest = read_json(&path).unwrap().unwrap();
     manifest.chains[0].chain_id = "../escape".into();
     publish(path.parent().unwrap(), MANIFEST, &manifest).unwrap();
 
@@ -846,4 +846,181 @@ fn a_failed_prefix_decoder_open_does_not_reserve_capacity() {
     assert_eq!(prefix_resources(&archive), (0, 0));
     assert!(admit(&archive, &log, 128));
     assert_eq!(prefix_resources(&archive), (0, 0));
+}
+
+fn native_options(root: &Path) -> Options {
+    Options {
+        cache: root.join("index.json"),
+        claude_home: root.join("claude"),
+        codex_home: root.join("codex"),
+        copilot_home: root.join("copilot"),
+        ..Options::default()
+    }
+}
+
+fn native_input(options: &Options, relative: &str, bytes: &[u8]) -> Input {
+    let input = Input {
+        root: InputRoot::Claude,
+        path: relative.to_owned(),
+    };
+    let path = input.full_path(options);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    input
+}
+
+fn prepare(options: &Options, input: &Input, budget: Option<u64>) {
+    let mut cache = crate::events::EventCache::open_scoped(&options.cache).unwrap();
+    cache.scan_byte_budget = budget;
+    crate::model::prepare_sources(
+        options,
+        &mut cache,
+        std::slice::from_ref(input),
+        crate::model::now_ms(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn complete_archive_rebuilds_identical_native_rows_and_sidecar() {
+    use rusqlite::{Connection, types::Value};
+    let (scratch, archive) = archive();
+    let options = native_options(&scratch.0);
+    let name = "projects/p/parent/subagents/agent-child.jsonl";
+    let body = b"{\"type\":\"user\",\"sessionId\":\"parent\",\"uuid\":\"u\",\"timestamp\":\"2026-10-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"synthetic prompt\"}}\n";
+    let input = native_input(&options, name, body);
+    let path = input.full_path(&options);
+    let sidecar = path.with_extension("meta.json");
+    fs::write(
+        &sidecar,
+        br#"{"toolUseId":"tool_1","description":"synthetic worker"}"#,
+    )
+    .unwrap();
+    prepare(&options, &input, None);
+    let snapshot = |options: &Options| {
+        let db = Connection::open(crate::events::EventCache::path(&options.cache)).unwrap();
+        [
+            "SELECT * FROM files ORDER BY file_id",
+            "SELECT * FROM events ORDER BY file_id,extra,seq",
+            "SELECT * FROM meta WHERE key GLOB 'native_claude_sidecar:*' ORDER BY key",
+        ]
+        .map(|sql| {
+            let mut statement = db.prepare(sql).unwrap();
+            let width = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    };
+    let original = snapshot(&options);
+    assert!(!original[1].is_empty());
+    assert!(!original[2].is_empty());
+    fs::remove_file(&path).unwrap();
+    fs::remove_file(sidecar).unwrap();
+    fs::remove_file(archive.dir.join(SOURCES)).unwrap();
+    let rebuilt = Options {
+        cache: scratch.0.join("rebuilt.json"),
+        ..options
+    };
+    let page = crate::inputs::Discovery::default()
+        .next(&rebuilt, 64, 64)
+        .unwrap();
+    assert_eq!(page.inputs, [input.clone()]);
+    let (native, _) = archive.open_native(&rebuilt, &path).unwrap().unwrap();
+    assert_eq!(native.native_id, "child");
+    assert_eq!(
+        native.sidecar.unwrap().metadata.label.as_deref(),
+        Some("synthetic worker")
+    );
+    prepare(&rebuilt, &input, None);
+    assert_eq!(snapshot(&rebuilt), original);
+}
+
+#[test]
+fn checkpoints_and_unterminated_suffixes_stay_in_custody_without_replay() {
+    let (scratch, archive) = archive();
+    let options = native_options(&scratch.0);
+    let mut bytes = b"{}\n".repeat(4);
+    for (name, budget) in [("checkpoint", Some(1)), ("suffix", None)] {
+        if budget.is_none() {
+            bytes.extend(b"{\"partial\":");
+        }
+        let input = native_input(&options, &format!("projects/p/{name}.jsonl"), &bytes);
+        prepare(&options, &input, budget);
+        let path = input.full_path(&options);
+        let key = path.to_str().unwrap();
+        let chain = archive.chains(key).unwrap().remove(0);
+        assert_eq!(chain.length, if budget.is_some() { 3 } else { 12 });
+        assert_eq!(
+            read_chain(&archive, key, &chain),
+            bytes[..chain.length as usize]
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(archive.open_native(&options, &path).unwrap().is_none());
+        assert!(Archive::native_inputs(&options).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn retention_requires_a_policy_and_respects_age_and_index_markers() {
+    let (scratch, archive) = archive();
+    let options = native_options(&scratch.0);
+    let input = native_input(&options, "projects/p/marked.jsonl", b"{}\n");
+    let path = input.full_path(&options);
+    let key = path.to_str().unwrap();
+    prepare(&options, &input, None);
+    let marked = archive.chains(key).unwrap().remove(0);
+    // Use a second cache stem because both indexes share this archive.
+    let marker_db = rusqlite::Connection::open(scratch.0.join("sibling.sqlite3")).unwrap();
+    marker_db
+        .execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    marker_db
+        .execute(
+            "INSERT INTO meta VALUES(?1,?2)",
+            [
+                format!("archive_event_index:{key}"),
+                r#"{"version":7}"#.to_owned(),
+            ],
+        )
+        .unwrap();
+    let expired = preserve(&archive, "expired", b"expired\n", "none").unwrap();
+    let boundary = preserve(&archive, "boundary", b"boundary\n", "none").unwrap();
+    for (source, admitted_ms) in [("expired", 0), ("boundary", 1), (key, 0)] {
+        let path = manifest_path(&archive, source);
+        let mut manifest = read_manifest(path.parent().unwrap()).unwrap();
+        manifest.chains[0].admitted_ms = admitted_ms;
+        publish(path.parent().unwrap(), MANIFEST, &manifest).unwrap();
+    }
+    assert_eq!(prune(&options.cache, None).unwrap(), 0);
+    assert_eq!(read_chain(&archive, "expired", &expired), b"expired\n");
+    assert_eq!(archive.prune_at(&options.cache, 1, 86_400_001).unwrap(), 1);
+    assert!(archive.chains("expired").unwrap().is_empty());
+    assert_eq!(read_chain(&archive, "boundary", &boundary), b"boundary\n");
+    assert_eq!(read_chain(&archive, key, &marked), b"{}\n");
+    assert_eq!(fs::read(path).unwrap(), b"{}\n");
+}
+
+#[test]
+fn unsupported_manifest_blocks_the_entire_prune() {
+    let (scratch, archive) = archive();
+    let cache = scratch.0.join("index.json");
+    let valid = preserve(&archive, "valid", b"keep\n", "none").unwrap();
+    preserve(&archive, "unknown", b"unknown\n", "none").unwrap();
+    let path = manifest_path(&archive, "unknown");
+    let mut manifest = read_manifest(path.parent().unwrap()).unwrap();
+    manifest.version += 1;
+    publish(path.parent().unwrap(), MANIFEST, &manifest).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert_eq!(prune(&cache, None).unwrap(), 0);
+    let error = archive.prune_at(&cache, 0, i64::MAX).unwrap_err();
+    assert!(error.to_string().contains("unsupported archive manifest"));
+    assert_eq!(fs::read(path).unwrap(), before);
+    assert_eq!(read_chain(&archive, "valid", &valid), b"keep\n");
 }

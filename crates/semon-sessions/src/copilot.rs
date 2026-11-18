@@ -105,7 +105,14 @@ pub fn validate_start(record: &Value, expected: &str) -> io::Result<String> {
 }
 
 pub(crate) fn header(path: &Path, expected: &str) -> io::Result<Option<String>> {
-    let file = crate::open_input(path)?;
+    read_header(crate::sealed::LogFile::open(path)?, expected)
+}
+
+pub(crate) fn read_header(
+    mut file: impl io::Read + io::Seek,
+    expected: &str,
+) -> io::Result<Option<String>> {
+    file.rewind()?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line)?;

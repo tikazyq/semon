@@ -155,6 +155,7 @@ pub(crate) struct Discovery {
     roots: std::vec::IntoIter<(InputRoot, String)>,
     stack: Vec<DiscoveryDir>,
     complete: bool,
+    archive: Option<(crate::archive::Archive, fs::ReadDir)>,
 }
 struct DiscoveryDir {
     root: InputRoot,
@@ -179,6 +180,7 @@ impl Default for Discovery {
             .into_iter(),
             stack: Vec::new(),
             complete: false,
+            archive: None,
         }
     }
 }
@@ -220,6 +222,23 @@ impl Discovery {
         while !self.complete && page.inputs.len() < sources && page.examined < entries {
             if self.stack.is_empty() {
                 let Some((root, relative)) = self.roots.next() else {
+                    if self.archive.is_none() && options.facts.is_none() {
+                        let archive = crate::archive::Archive::new(crate::archive::standalone_dir(
+                            &options.cache,
+                        ));
+                        if let Some(entries) = archive.directories()? {
+                            self.archive = Some((archive, entries));
+                        }
+                    }
+                    if let Some((archive, entries)) = &mut self.archive
+                        && let Some(entry) = entries.next()
+                    {
+                        page.examined += 1;
+                        if let Some(input) = archive.discover_entry(entry?, options)? {
+                            page.inputs.push(input);
+                        }
+                        continue;
+                    }
                     self.complete = true;
                     break;
                 };

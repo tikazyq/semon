@@ -669,3 +669,46 @@ fn planted_seal_temporary_symlinks_never_truncate_the_target() {
     assert_eq!(remove_temporaries(&root).unwrap(), 0);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn deleted_sealed_native_log_reads_from_archive_and_keeps_custody() {
+    let root = scratch("archived-sealed-native");
+    let options = crate::Options {
+        cache: root.join("index.json"),
+        claude_home: root.join("claude"),
+        codex_home: root.join("codex"),
+        copilot_home: root.join("copilot"),
+        ..crate::Options::default()
+    };
+    let input = crate::Input {
+        root: crate::InputRoot::Claude,
+        path: "projects/p/log.jsonl".into(),
+    };
+    let path = input.full_path(&options);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes = b"{}\n".repeat(20_000);
+    fs::write(&path, &bytes).unwrap();
+    seal(&path, BLOCK, u64::MAX).unwrap();
+    assert!(read_manifest(&seal_dir(&path)).unwrap().unwrap().end() > 0);
+    let mut cache = crate::events::EventCache::open_scoped(&options.cache).unwrap();
+    crate::model::prepare_sources(&options, &mut cache, &[input], crate::model::now_ms()).unwrap();
+    let archive = crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache));
+    let key = path.to_str().unwrap();
+    let chain = archive.chains(key).unwrap().remove(0);
+    assert!(record_custody(&path, &archive, key, &chain).unwrap());
+    fs::remove_file(&path).unwrap();
+    let (_, mut reader) = archive.open_native(&options, &path).unwrap().unwrap();
+    let mut replayed = Vec::new();
+    reader.read_to_end(&mut replayed).unwrap();
+    assert_eq!(replayed, bytes);
+    // Zero days expires every chain admitted before the current instant.
+    let other = archive
+        .preserve("unprotected", &mut &b"unprotected\n"[..], "none")
+        .unwrap()
+        .unwrap();
+    let now = chain.admitted_ms.max(other.admitted_ms).saturating_add(1);
+    assert_eq!(archive.prune_at(&options.cache, 0, now).unwrap(), 1);
+    assert_eq!(archive.chains(key).unwrap(), [chain]);
+    assert!(seal_dir(&path).join(CUSTODY).is_file());
+    fs::remove_dir_all(root).unwrap();
+}

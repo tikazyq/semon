@@ -30,7 +30,7 @@ use crate::{Tokens, archive::Archive, attachments, field, sealed::LogFile};
 pub(crate) mod session_activity;
 pub(crate) mod store;
 pub(crate) use store::open_regular;
-pub(crate) use store::{archive_index_retained, retain_archive_index};
+pub(crate) use store::{archive_index_retained, archive_retention_paths, retain_archive_index};
 
 #[cfg(test)]
 thread_local! {
@@ -942,7 +942,7 @@ pub(crate) fn fixed_change_time_for_test(value: i128) -> impl Drop {
 }
 
 /// How many bytes the ledger's tail hash covers before its offset.
-const WINDOW: u64 = 4096;
+pub(crate) const WINDOW: u64 = 4096;
 
 #[cfg(test)]
 thread_local! {
@@ -2212,22 +2212,44 @@ impl EventCache {
     /// Admits every scanned native prefix, including unchanged ones so lost
     /// custody is repaired. Intact chains use the verification cache. A failure is
     /// reported and retried by the next full scan; it does not stop the read.
-    pub(crate) fn archive_consumed(&mut self, cache: &Path, seen: &BTreeSet<String>) {
+    pub(crate) fn archive_consumed(
+        &mut self,
+        options: &crate::Options,
+        input: crate::inputs::Input,
+        native_id: &str,
+        sidecar: Option<crate::native_sidecar::ClaudeSidecar>,
+    ) {
+        let path = input.full_path(options);
+        let Some(key) = path.to_str() else { return };
+        let Some(ledger) = self.files.get(key).map(|file| file.ledger.clone()) else {
+            return;
+        };
         let archive = self
             .archive
-            .get_or_insert_with(|| Archive::new(crate::archive::standalone_dir(cache)));
-        for key in seen {
-            let Some(file) = self.files.get(key) else {
-                continue;
-            };
-            let consumed = (file.ledger.offset, file.ledger.prefix);
-            let admitted = LogFile::open(Path::new(key))
-                .and_then(|mut log| archive.admit(key, &mut log, consumed.0, &consumed.1));
-            match admitted {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => eprintln!("semon: native log archive: {key}: {error}"),
-            }
+            .get_or_insert_with(|| Archive::new(crate::archive::standalone_dir(&options.cache)));
+        let admitted = (|| {
+            let mut log = LogFile::open(&path)?;
+            let stat = Stat::from_metadata(&log.metadata()?)?;
+            let complete = stat == ledger.stat && stat.size == ledger.offset;
+            archive.admit_native(
+                key,
+                &mut log,
+                crate::archive::NativeSource {
+                    root: input.root.as_str().to_owned(),
+                    home: input.root.home(options).clone(),
+                    absolute_home: std::path::absolute(input.root.home(options))?,
+                    path: input.path,
+                    native_id: native_id.to_owned(),
+                    ledger,
+                    sidecar,
+                    complete,
+                },
+            )
+        })();
+        match admitted {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("semon: native log archive: {key}: {error}"),
         }
     }
 
@@ -2964,6 +2986,16 @@ pub(crate) fn scan_file(
     cache: &mut EventCache,
     dirty: &mut bool,
 ) -> io::Result<Arc<FileIndex>> {
+    scan_source(path, harness, cache, dirty, None)
+}
+
+pub(crate) fn scan_source(
+    path: &Path,
+    harness: &str,
+    cache: &mut EventCache,
+    dirty: &mut bool,
+    options: Option<&crate::Options>,
+) -> io::Result<Arc<FileIndex>> {
     let key = path.to_string_lossy().into_owned();
     if let Some(index) = cache.files.get(&key).and_then(|entry| entry.index.as_ref()) {
         cache.require_usage_store(index)?;
@@ -3000,7 +3032,7 @@ pub(crate) fn scan_file(
                 .claude_sidecar
                 .as_ref()
                 .is_some_and(|sidecar| sidecar.current(path)))
-        && entry.ledger.stat == Stat::of(path)?
+        && Stat::of(path).is_ok_and(|stat| entry.ledger.stat == stat)
     {
         trace("unchanged");
         return Ok(Arc::clone(index));
@@ -3015,11 +3047,25 @@ pub(crate) fn scan_file(
         // Stat'ed before reading: a line that lands during the read makes
         // the next check see a change.
         let started = cache.scan_measurements.start();
-        let mut file = LogFile::open(path)?;
-        let stat = Stat::from_metadata(&file.metadata()?)?;
+        let (mut file, archived, stat) = match LogFile::open(path) {
+            Ok(file) => {
+                let stat = Stat::from_metadata(&file.metadata()?)?;
+                (file, None, stat)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && options.is_some() => {
+                let options = options.expect("standalone archive options");
+                let archive = cache.archive.get_or_insert_with(|| {
+                    Archive::new(crate::archive::standalone_dir(&options.cache))
+                });
+                let (native, file) = archive.open_native(options, path)?.ok_or(error)?;
+                let stat = native.ledger.stat;
+                (file, Some(native), stat)
+            }
+            Err(error) => return Err(error),
+        };
         cache.scan_measurements.record("open_stat", started, 1);
         let started = cache.scan_measurements.start();
-        if harness == "codex" {
+        if harness == "codex" && archived.is_none() {
             let recorded_started = cache.scan_measurements.start();
             let absent = cache.recorded(&key).is_none();
             cache
@@ -3050,6 +3096,9 @@ pub(crate) fn scan_file(
         let mut trusted_append = false;
         if let Some(ledger) = &recorded
             && !force_replace
+            && archived
+                .as_ref()
+                .is_none_or(|native| native.ledger == *ledger)
         {
             let evidence = !conservative_append
                 && cache
@@ -3081,7 +3130,9 @@ pub(crate) fn scan_file(
         }
         cache.scan_measurements.record("ledger_base", started, 1);
         let started = agent.then(|| cache.scan_measurements.start()).flatten();
-        let sidecar = if agent {
+        let sidecar = if let Some(native) = &archived {
+            native.sidecar.clone()
+        } else if agent {
             match crate::native_sidecar::ClaudeSidecar::observe(
                 path,
                 base.as_ref()
@@ -3111,6 +3162,7 @@ pub(crate) fn scan_file(
             && index.handoff_index.is_some()
             && (harness != "codex" || index.codex_header.is_some())
             && (!agent
+                || (archived.is_some() && index.claude_sidecar == sidecar)
                 || sidecar
                     .as_ref()
                     .is_some_and(|observed| index.claude_sidecar.as_ref() == Some(observed)))
@@ -3126,6 +3178,15 @@ pub(crate) fn scan_file(
                 },
             );
             return Ok(Arc::clone(index));
+        }
+        if let Some(native) = &archived
+            && harness == "copilot"
+            && crate::copilot::read_header(&mut file, &native.native_id)?.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing archived Copilot header",
+            ));
         }
         let from = match (&recorded, &base) {
             (Some(ledger), Some(_)) => ledger.offset,
@@ -3245,7 +3306,11 @@ pub(crate) fn scan_file(
             from,
             harness,
             writable,
-            cache.scan_byte_budget,
+            if archived.is_some() {
+                None
+            } else {
+                cache.scan_byte_budget
+            },
             append
                 .then(|| {
                     cache
@@ -3323,10 +3388,11 @@ pub(crate) fn scan_file(
                 continue;
             }
         }
-        if writable
-            .claude_sidecar
-            .as_ref()
-            .is_some_and(|sidecar| !sidecar.current(path))
+        if archived.is_none()
+            && writable
+                .claude_sidecar
+                .as_ref()
+                .is_some_and(|sidecar| !sidecar.current(path))
         {
             if last {
                 // Keep the native session under bounded sidecar churn, using
@@ -3349,6 +3415,29 @@ pub(crate) fn scan_file(
             prefix,
             tail,
         };
+        if let Some(native) = &archived {
+            if native.ledger != ledger
+                || (harness == "codex"
+                    && writable
+                        .codex_header
+                        .as_ref()
+                        .and_then(|header| header.native_id(path))
+                        .as_ref()
+                        != Some(&native.native_id))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "archive does not match native index",
+                ));
+            }
+            if !matches!(crate::open_input(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "native source reappeared during indexing",
+                ));
+            }
+        }
         // A byte slice must retain one exact physical generation across its
         // checkpoint. Untrusted changes never qualify the continuation proof.
         if bounded && Stat::of(path).ok().as_ref() != Some(&stat) {
@@ -3403,7 +3492,8 @@ pub(crate) fn scan_file(
                 hook();
             }
         }
-        if cache.scan_byte_budget.is_some()
+        if archived.is_none()
+            && cache.scan_byte_budget.is_some()
             && recorded.is_none()
             && !bounded
             && ledger.offset == ledger.stat.size
@@ -10517,8 +10607,17 @@ mod archive_tests {
         let name = format!("semon-archive-retry-{}", std::process::id());
         let root = std::env::temp_dir().join(name);
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("a.jsonl");
+        let options = crate::Options {
+            claude_home: root.join("claude"),
+            cache: root.join("index.json"),
+            ..crate::Options::default()
+        };
+        let input = crate::Input {
+            root: crate::InputRoot::Claude,
+            path: "projects/p/a.jsonl".into(),
+        };
+        let path = input.full_path(&options);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let consumed = b"{\"a\":1}\n{\"b\":2}\n";
         // The log was rewritten after the index read it.
         fs::write(&path, b"{\"changed\":true}\n{\"b\":2}\n").unwrap();
@@ -10543,13 +10642,12 @@ mod archive_tests {
             },
         );
         let archive = Archive::new(root.join("archive"));
-        let seen = BTreeSet::from([key.clone()]);
-        cache.archive_consumed(&root.join("index.json"), &seen);
+        cache.archive_consumed(&options, input.clone(), "a", None);
         assert!(archive.chains(&key).unwrap().is_empty());
 
         // The log holds the consumed bytes again: the next scan admits it.
         fs::write(&path, consumed).unwrap();
-        cache.archive_consumed(&root.join("index.json"), &seen);
+        cache.archive_consumed(&options, input, "a", None);
         assert_eq!(archive.chains(&key).unwrap().len(), 1);
         fs::remove_dir_all(root).unwrap();
     }

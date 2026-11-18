@@ -132,6 +132,23 @@ persistent transcript slot projection, indexed range loading, source/relationshi
 resolution and full native page/tool oracle comparisons remain pending. A full
 selected FileIndex decode must not become the normal per-page fallback.
 
+## Standalone archive reads
+
+Standalone discovery also admits missing JSONL logs whose current archive
+observation is complete and verified. The manifest ties the configured home and
+allowlisted relative path to the original native ID, physical ledger, Claude
+sidecar observation, and exact archive chain. A live native carrier takes
+precedence. Bounded checkpoints and logs with an unconsumed EOF suffix preserve
+their archived prefix in custody without advertising a rebuildable source.
+
+Replay verifies the length and SHA-256 of the logical chain and the ledger's
+tail digest. A private seekable snapshot feeds the same native index parser
+used for live files, preserving offsets, source identity, and sidecar evidence.
+If the archived source was sealed, the archiver copied its logical bytes
+through the sealed log reader. Replay works after the native file is removed.
+The archive does not grant hosted provider access or change that provider's
+request authorization.
+
 ## R5 publication and proof audit (Phase A)
 
 This audit describes the pre-repair implementation. A confirmed diagnostic defect is distinct from a reachable publication interleaving, and neither establishes the live HP Code 1 failure without stage evidence. The sanitized 2026-10-21 05:21 UTC sample selected 27,751,814 consumed bytes and returned `size_grew`; it did not sample Raw length, Index ledger or proof header in a common snapshot.
@@ -360,11 +377,12 @@ Only the exact configured SQLite derived index is cleared. Native logs, archive
 objects, credentials, unrelated files and retired JSON caches remain untouched.
 Physical corruption retains its existing set-aside/recovery behavior.
 
-Reindexing cannot recover history, retained recipes or reported facts whose
-original supported native source bytes are gone or inaccessible. Archive bytes
-are preserved but old derived archive markers are not converted into new read
-authority; an authorized source/provider must supply supported original bytes.
-Unsupported stores still propagate errors rather than empty in-memory history.
+Reindexing requires available native evidence. A complete verified standalone
+archive can restore its Event Index rows, while missing original evidence can
+leave history, retained recipes, or reported facts unavailable. Archive contents
+are preserved across index repair. Index retention markers use version 7 and
+are not converted into archive read authority. Unsupported stores propagate
+errors rather than reporting empty in-memory history.
 
 Current native usage writes persist the normalized source facts and dimensions
 with the ledger. Tree writes maintain copied-usage identities through the current

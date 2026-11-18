@@ -29,7 +29,7 @@ pub(crate) mod session_activity;
 pub(crate) mod tree_state;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -806,6 +806,7 @@ pub(crate) fn audit_catalog_sources(
     let machine = crate::facts::MachineFacts::of(options);
     let tx = Transaction::new_unchecked(&store.connection, TransactionBehavior::Immediate)
         .map_err(io::Error::other)?;
+    let archive = crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache));
     let mut changed = std::collections::BTreeSet::new();
     for input in discovered {
         if input.root == crate::InputRoot::Codex
@@ -840,8 +841,18 @@ pub(crate) fn audit_catalog_sources(
         let path = input.full_path(options);
         let key = path.to_string_lossy().into_owned();
         let recorded = ledger_row(&tx, &key).map_err(io::Error::other)?;
+        let archived = if options.facts.is_none()
+            && matches!(std::fs::symlink_metadata(&path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            archive.find_native(options, &path)?
+        } else {
+            None
+        };
         if match recorded.as_ref() {
-            Some((_, ledger)) => super::Stat::of(&path).ok().as_ref() != Some(&ledger.stat),
+            Some((_, ledger)) => match &archived {
+                Some(native) => native.ledger != *ledger,
+                None => super::Stat::of(&path).ok().as_ref() != Some(&ledger.stat),
+            },
             None => true,
         } {
             changed.insert(key.clone());
@@ -860,7 +871,11 @@ pub(crate) fn audit_catalog_sources(
                 &ledger,
             )
             .map_err(io::Error::other)?;
-            if sidecar.is_none_or(|sidecar| !sidecar.current(&path)) {
+            let changed_sidecar = match &archived {
+                Some(native) => native.sidecar != sidecar,
+                None => sidecar.is_none_or(|sidecar| !sidecar.current(&path)),
+            };
+            if changed_sidecar {
                 changed.insert(key);
             }
         }
@@ -890,9 +905,18 @@ pub(crate) fn audit_catalog_sources(
                 && !machine.codex_rollout_is_current(options, Path::new(&path)))
                 || saved_runtime != expected.as_deref()
                 || match recorded.as_ref() {
-                    Some((_, ledger)) => {
-                        super::Stat::of(Path::new(&path)).ok().as_ref() != Some(&ledger.stat)
-                    }
+                    Some((_, ledger)) => match super::Stat::of(Path::new(&path)) {
+                        Ok(stat) => stat != ledger.stat,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::NotFound
+                                && options.facts.is_none() =>
+                        {
+                            archive
+                                .find_native(options, Path::new(&path))?
+                                .is_none_or(|native| native.ledger != *ledger)
+                        }
+                        Err(_) => true,
+                    },
                     None => true,
                 }
             {
@@ -1189,11 +1213,18 @@ pub(crate) fn requeue_concurrent_sources(
     options: &crate::Options,
     prepared: &crate::model::PreparedSources,
 ) -> io::Result<()> {
+    let archive = crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache));
     let paths = prepared
         .rows
         .iter()
         .flat_map(|row| &row.sources)
         .filter(|source| {
+            if options.facts.is_none()
+                && matches!(std::fs::symlink_metadata(&source.path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                && archive.matches_source(options, source, None).unwrap_or(false)
+            {
+                return false;
+            }
             super::Stat::of(&source.path).ok().is_none_or(|stat| {
                 (
                     stat.dev,
@@ -4765,7 +4796,7 @@ fn qualify(connection: &Connection) -> rusqlite::Result<Init> {
         return Ok(found);
     }
     let unsupported_archive: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM meta WHERE key GLOB 'archive_event_index:*' AND CASE WHEN octet_length(value)<=16384 AND json_valid(value) THEN COALESCE(json_type(value,'$.version')<>'integer' OR json_extract(value,'$.version')<>6 OR json_extract(value,'$.parser_version')<>?1,1) ELSE 1 END)",
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key GLOB 'archive_event_index:*' AND CASE WHEN octet_length(value)<=16384 AND json_valid(value) THEN COALESCE(json_type(value,'$.version')<>'integer' OR json_extract(value,'$.version')<>7 OR json_extract(value,'$.parser_version')<>?1,1) ELSE 1 END)",
         [CACHE_VERSION],
         |row| row.get(0),
     )?;
@@ -4918,7 +4949,7 @@ struct ArchivedIndex {
 
 impl ArchivedIndex {
     fn matches(&self, ledger: &Ledger) -> bool {
-        self.version == 6
+        self.version == 7
             && self.source_chunks_sha256.as_ref().is_some_and(|hash| {
                 hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
@@ -4951,6 +4982,46 @@ impl ArchivedIndex {
             && self.source.prefix_sha256 == ledger.prefix
             && self.source.tail_sha256 == ledger.tail
     }
+}
+
+/// All index stems beside this archive share its custody. Protect every chain
+/// for a marked path, including historical generations of that path.
+pub(crate) fn archive_retention_paths(cache: &Path) -> io::Result<BTreeSet<String>> {
+    let parent = cache
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut paths = BTreeSet::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry.path().extension().is_none_or(|ext| ext != "sqlite3") {
+            continue;
+        }
+        let db = Connection::open_with_flags(
+            entry.path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(io::Error::other)?;
+        let has_meta: bool = db
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type='table' AND name='meta')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(io::Error::other)?;
+        if !has_meta {
+            continue;
+        }
+        let mut statement = db.prepare("SELECT substr(key, length('archive_event_index:')+1) FROM meta WHERE key GLOB 'archive_event_index:*'")
+            .map_err(io::Error::other)?;
+        let entries = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(io::Error::other)?;
+        for path in entries {
+            paths.insert(path.map_err(io::Error::other)?);
+        }
+    }
+    Ok(paths)
 }
 
 fn archive_index_key(path: &str) -> String {
@@ -4996,7 +5067,7 @@ fn archived_index(connection: &Connection, path: &str) -> rusqlite::Result<Optio
             let record: ArchivedIndex =
                 serde_json::from_str(&value.ok_or(rusqlite::Error::InvalidQuery)?)
                     .map_err(|_| rusqlite::Error::InvalidQuery)?;
-            if record.version != 6 || record.parser_version != CACHE_VERSION {
+            if record.version != 7 || record.parser_version != CACHE_VERSION {
                 return Err(rusqlite::Error::InvalidQuery);
             }
             Ok(record)
@@ -5107,7 +5178,7 @@ pub(crate) fn retain_archive_index(
         };
     }
     let record = ArchivedIndex {
-        version: 6,
+        version: 7,
         parser_version: CACHE_VERSION,
         source: proof.source.clone(),
         stat: expected.stat,
@@ -5140,18 +5211,18 @@ pub(crate) fn archive_index_retained(
         return Ok(false);
     };
     let header_matches = if proof.source.root == "codex" {
-        record.version == 6
+        record.version == 7
             && record.native_header_sha256.is_some()
             && record.native_header_sha256 == codex_header_digest(connection, path)?
     } else if proof.source.root == "claude" && crate::native_sidecar::agent_path(Path::new(path)) {
         let mut statement = connection.prepare(NATIVE_METADATA_VALUE)?;
         let sidecar = read_claude_sidecar(&mut statement, path, &ledger)?;
-        record.version == 6
+        record.version == 7
             && record.native_header_sha256.is_some()
             && record.native_header_sha256 == claude_sidecar_digest(connection, path)?
             && sidecar.is_some_and(|sidecar| sidecar.verified(Path::new(path)))
     } else {
-        record.version == 6
+        record.version == 7
     };
     Ok(header_matches
         && record.launch_calls_sha256.is_some()
@@ -10433,7 +10504,7 @@ mod tests {
             ),
             (
                 "archive",
-                "INSERT INTO meta VALUES('archive_event_index:original','{\"version\":7}')",
+                "INSERT INTO meta VALUES('archive_event_index:original','{\"version\":8}')",
                 "archived marker version",
             ),
         ] {

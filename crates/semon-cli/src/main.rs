@@ -22,6 +22,10 @@ enum Command {
     Receive(ReceiveArgs),
     Query(QueryArgs),
     Materialize(MaterializeArgs),
+    ArchivePrune {
+        cache: PathBuf,
+        retention_days: Option<u64>,
+    },
     Mcp(HomeArgs),
 }
 
@@ -132,12 +136,44 @@ fn parse_args() -> Result<Command, String> {
         Some("push") => parse_push_args(arguments).map(Command::Push),
         Some("receive") => parse_receive_args(arguments).map(Command::Receive),
         Some("query") => parse_query_args(arguments).map(Command::Query),
+        Some("archive") => parse_archive_args(arguments),
         Some("analytics") => parse_analytics_args(arguments).map(Command::Materialize),
         Some("mcp") => parse_mcp_args(arguments).map(Command::Mcp),
         Some("-h" | "--help") => Err(usage()),
         Some(command) => Err(format!("unknown command: {command}\n{}", usage())),
         None => Err(usage()),
     }
+}
+
+fn parse_archive_args(mut arguments: impl Iterator<Item = String>) -> Result<Command, String> {
+    let usage = "Usage: semon archive prune [--retention-days N] [--cache PATH]";
+    if arguments.next().as_deref() != Some("prune") {
+        return Err(usage.to_owned());
+    }
+    let mut cache = semon_sessions::Options::default().cache;
+    let mut retention_days = None;
+    while let Some(argument) = arguments.next() {
+        let mut value = || {
+            arguments
+                .next()
+                .ok_or_else(|| format!("{argument} requires a value"))
+        };
+        match argument.as_str() {
+            "--cache" => cache = value()?.into(),
+            "--retention-days" => {
+                retention_days =
+                    Some(value()?.parse::<u64>().map_err(|_| {
+                        "--retention-days requires a nonnegative integer".to_owned()
+                    })?)
+            }
+            "-h" | "--help" => return Err(usage.to_owned()),
+            _ => return Err(format!("unknown archive prune argument: {argument}")),
+        }
+    }
+    Ok(Command::ArchivePrune {
+        cache,
+        retention_days,
+    })
 }
 
 fn parse_analytics_args(
@@ -568,6 +604,19 @@ fn run(command: Command) -> Result<(), String> {
         Command::Push(args) => run_push(&args),
         Command::Receive(args) => run_receive(args),
         Command::Query(args) => run_query(args),
+        Command::ArchivePrune {
+            cache,
+            retention_days,
+        } => {
+            let removed = semon_sessions::archive::prune(&cache, retention_days)
+                .map_err(|error| error.to_string())?;
+            if retention_days.is_none() {
+                println!("No archive chains pruned. Set --retention-days to enable deletion.");
+            } else {
+                println!("Archive chains pruned: {removed}");
+            }
+            Ok(())
+        }
         Command::Materialize(args) => run_materialize(args),
         Command::Mcp(home) => run_mcp(&home),
     }
@@ -980,6 +1029,9 @@ fn usage() -> String {
          Usage: semon analytics materialize [--watch] [--since DURATION | --all] [home options as for sessions]\n\
          Explicitly refreshes the local native Catalog and materializes local-only analytics. Nothing starts this writer by default.\n\
          \n\
+         Usage: semon archive prune [--retention-days N] [--cache PATH]\n\
+         Prunes standalone archive chains older than N days. Without a retention flag it deletes nothing.\n\
+         \n\
          Usage: semon mcp [--since DURATION | --all] [--claude-home PATH] [--claude-json PATH] [--codex-home PATH] [--proc-root PATH] [--cache PATH] [--facts FILE] [--machine DIR]...\n\
          The same tools as a Model Context Protocol server on stdin and stdout. Read-only; no listener. Both read\n\
          the log files modified within the window, --since (30d by default), or all of them with --all.\n\
@@ -1001,6 +1053,29 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_prune_requires_opt_in_and_accepts_a_cache_override() {
+        assert!(matches!(
+            parse_archive_args(["prune"].into_iter().map(str::to_owned)),
+            Ok(Command::ArchivePrune {
+                retention_days: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_archive_args(["prune", "--cache", "different.json", "--retention-days", "0"].into_iter().map(str::to_owned)),
+            Ok(Command::ArchivePrune { retention_days: Some(0), cache }) if cache == Path::new("different.json")
+        ));
+        assert!(
+            parse_archive_args(
+                ["prune", "--retention-days", "-1"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn paused_find_refuses_stale_and_malformed_cli_calls_before_initialization() {

@@ -20,7 +20,7 @@
 //! Two writers use it:
 //! - a receiver calls [`Archive::preserve`] with the logical bytes of a
 //!   mirrored file before it replaces them: an immutable chain per replace;
-//! - a standalone machine calls [`Archive::admit`] with each native log and
+//! - a standalone machine calls [`Archive::admit_native`] with each native log and
 //!   the offset and digest its index has consumed: one chain per native
 //!   generation, extended by appending frames, and a new chain when the log
 //!   was rewritten. The old chain stays.
@@ -28,7 +28,7 @@
 //! The archive only copies: it never touches, shortens or removes a log.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -38,7 +38,13 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
-use crate::{sealed::hex, source_chunks::PrefixState};
+use crate::{
+    Input, InputRoot, Options,
+    events::Ledger,
+    native_sidecar::ClaudeSidecar,
+    sealed::{LogFile, hex},
+    source_chunks::PrefixState,
+};
 
 /// The archive's directory name, under a receiver's machine directory and
 /// under the Semon state directory.
@@ -52,6 +58,7 @@ pub const NATIVE_REDACTOR: &str = "none";
 
 const SOURCES: &str = "sources.log";
 const MANIFEST: &str = "manifest.json";
+const VERSION: u32 = 1;
 const LOCK: &str = ".lock";
 const LEVEL: i32 = 3;
 const METADATA_MAX: u64 = 64 << 20;
@@ -66,11 +73,21 @@ pub fn standalone_dir(cache: &Path) -> PathBuf {
     cache.parent().unwrap_or_else(|| Path::new("")).join(DIR)
 }
 
+/// Explicit standalone retention. An omitted policy does not open the archive.
+pub fn prune(cache: &Path, retention_days: Option<u64>) -> io::Result<usize> {
+    let Some(days) = retention_days else {
+        return Ok(0);
+    };
+    Archive::new(standalone_dir(cache)).prune_at(cache, days, crate::model::now_ms())
+}
+
 /// One chain of a source: bytes `[0, length)` of one generation of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chain {
     /// Random; names the chain's file, `<chain_id>.zst`.
     pub chain_id: String,
+    /// Admission time in epoch milliseconds. Extensions keep this time.
+    pub admitted_ms: i64,
     /// Plain bytes the chain holds.
     pub length: u64,
     /// SHA-256 (lowercase hex) of those bytes.
@@ -92,8 +109,46 @@ pub struct Chain {
 struct Manifest {
     /// The source key this directory belongs to, so a directory can always
     /// be attributed, whatever happens to `sources.log`.
+    version: u32,
     source: String,
     chains: Vec<Chain>,
+    native: BTreeMap<String, NativeSource>,
+    native_current: Option<String>,
+    seal_pins: BTreeSet<String>,
+}
+
+/// Original native observation for one chain. The map key binds this
+/// observation to the exact chain recorded in the same atomic manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeSource {
+    pub(crate) root: String,
+    pub(crate) home: PathBuf,
+    pub(crate) absolute_home: PathBuf,
+    pub(crate) path: String,
+    pub(crate) native_id: String,
+    pub(crate) ledger: Ledger,
+    pub(crate) sidecar: Option<ClaudeSidecar>,
+    /// A bounded checkpoint can have a synthetic ledger size equal to offset.
+    pub(crate) complete: bool,
+}
+
+impl NativeSource {
+    fn input(&self) -> Option<Input> {
+        let root = InputRoot::parse(&self.root)?;
+        (self.path.ends_with(".jsonl") && crate::is_input_path(&self.root, &self.path)).then(|| {
+            Input {
+                root,
+                path: self.path.clone(),
+            }
+        })
+    }
+
+    fn matches(&self, chain: &Chain) -> bool {
+        self.complete
+            && self.ledger.stat.size == self.ledger.offset
+            && self.ledger.offset == chain.length
+            && hex(&self.ledger.prefix) == chain.sha256
+    }
 }
 
 /// One line of `sources.log`.
@@ -176,7 +231,7 @@ impl Verification {
 }
 
 /// Holds the archive's advisory lock until dropped.
-struct Guard(#[allow(dead_code)] fs::File);
+pub(crate) struct Guard(#[allow(dead_code)] fs::File);
 
 impl Archive {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
@@ -245,6 +300,284 @@ impl Archive {
         operation(&mut open_chain(&dir, chain)?)
     }
 
+    /// Pin before publishing a seal certificate, even if its directory lies
+    /// outside the configured native homes. Interrupted publication over-retains.
+    pub(crate) fn pin_seal(
+        &self,
+        source: &str,
+        chain: &Chain,
+        check: impl FnOnce(&mut dyn Read) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let _guard = self.lock(true)?;
+        let id = self
+            .lookup_locked(source)?
+            .ok_or_else(|| invalid("missing seal custody source"))?;
+        let dir = self.dir.join(id);
+        let mut manifest = read_manifest(&dir)?;
+        if manifest.source != source
+            || !manifest.chains.contains(chain)
+            || !self.trusted(&dir, chain)
+        {
+            return Err(invalid("unverified seal custody chain"));
+        }
+        check(&mut open_chain(&dir, chain)?)?;
+        if manifest.seal_pins.insert(chain.chain_id.clone()) {
+            publish(&dir, MANIFEST, &manifest)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn directories(&self) -> io::Result<Option<fs::ReadDir>> {
+        match fs::symlink_metadata(&self.dir) {
+            Ok(meta) if meta.is_dir() => fs::read_dir(&self.dir).map(Some),
+            Ok(_) => Err(invalid("the archive is not a directory")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn manifest_dir(entry: fs::DirEntry) -> io::Result<Option<PathBuf>> {
+        if !entry.file_name().to_str().is_some_and(is_id) {
+            return Ok(None);
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid("invalid archive manifest directory"));
+        }
+        Ok(Some(entry.path()))
+    }
+
+    pub(crate) fn prune_at(&self, cache: &Path, days: u64, now_ms: i64) -> io::Result<usize> {
+        let Some(entries) = self.directories()? else {
+            return Ok(0);
+        };
+        let _guard = self.lock(true)?;
+        let cutoff = i128::from(now_ms) - i128::from(days) * 86_400_000;
+        let protected = crate::events::archive_retention_paths(cache)?;
+        // Validate the whole manifest set before the first deletion. Unknown
+        // directories and unmanifested objects have no deletion authority.
+        let mut plans = Vec::new();
+        for entry in entries {
+            let Some(dir) = Self::manifest_dir(entry?)? else {
+                continue;
+            };
+            let manifest = read_manifest(&dir)?;
+            if manifest.source.is_empty() || protected.contains(&manifest.source) {
+                continue;
+            }
+            let custody = if manifest.native.is_empty() {
+                None
+            } else {
+                crate::sealed::custody_chain(
+                    Path::new(&manifest.source),
+                    &self.directory()?,
+                    &manifest.source,
+                )?
+            };
+            let expired = manifest
+                .chains
+                .iter()
+                .filter(|chain| {
+                    i128::from(chain.admitted_ms) < cutoff
+                        && !manifest.seal_pins.contains(&chain.chain_id)
+                        && custody.as_ref() != Some(&chain.chain_id)
+                })
+                .map(|chain| chain.chain_id.clone())
+                .collect::<BTreeSet<_>>();
+            if !expired.is_empty() {
+                plans.push((dir, manifest, expired));
+            }
+        }
+        let mut removed = 0;
+        for (dir, mut manifest, expired) in plans {
+            manifest
+                .chains
+                .retain(|chain| !expired.contains(&chain.chain_id));
+            manifest.native.retain(|id, _| !expired.contains(id));
+            if manifest
+                .native_current
+                .as_ref()
+                .is_some_and(|id| expired.contains(id))
+            {
+                manifest.native_current = None;
+            }
+            publish(&dir, MANIFEST, &manifest)?;
+            for id in expired {
+                match fs::remove_file(dir.join(format!("{id}.zst"))) {
+                    Ok(()) => removed += 1,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            sync_dir(&dir)?;
+        }
+        Ok(removed)
+    }
+
+    fn available<'a>(
+        manifest: &'a Manifest,
+        options: &Options,
+    ) -> io::Result<Option<(&'a NativeSource, &'a Chain, Input)>> {
+        let Some(id) = &manifest.native_current else {
+            return Ok(None);
+        };
+        let native = &manifest.native[id];
+        let chain = manifest
+            .chains
+            .iter()
+            .find(|chain| &chain.chain_id == id)
+            .expect("validated native chain");
+        let input = native.input().expect("validated native path");
+        if !native.matches(chain)
+            || input.root.home(options) != &native.home
+            || std::path::absolute(input.root.home(options))? != native.absolute_home
+        {
+            return Ok(None);
+        }
+        match crate::open_input(&input.full_path(options)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Ok(None),
+        }
+        Ok(Some((native, chain, input)))
+    }
+
+    pub(crate) fn discover_entry(
+        &self,
+        entry: fs::DirEntry,
+        options: &Options,
+    ) -> io::Result<Option<Input>> {
+        let Some(dir) = Self::manifest_dir(entry)? else {
+            return Ok(None);
+        };
+        let _guard = self.lock(false)?;
+        let manifest = read_manifest(&dir)?;
+        let Some((_, chain, input)) = Self::available(&manifest, options)? else {
+            return Ok(None);
+        };
+        if !self.trusted(&dir, chain) {
+            return Err(invalid("unverified native archive chain"));
+        }
+        Ok(Some(input))
+    }
+
+    pub(crate) fn native_inputs(options: &Options) -> io::Result<Vec<Input>> {
+        let archive = Self::new(standalone_dir(&options.cache));
+        let Some(entries) = archive.directories()? else {
+            return Ok(Vec::new());
+        };
+        let mut inputs = Vec::new();
+        for entry in entries {
+            if let Some(input) = archive.discover_entry(entry?, options)? {
+                inputs.push(input);
+            }
+        }
+        inputs.sort();
+        inputs.dedup();
+        Ok(inputs)
+    }
+
+    /// Normally the journal resolves the directory. A standalone manifest can
+    /// still supply the recorded observation if its journal is missing.
+    fn native_dir(&self, key: &str) -> io::Result<Option<PathBuf>> {
+        if let Some(id) = self.lookup_locked(key)? {
+            return Ok(Some(self.dir.join(id)));
+        }
+        let mut found = None;
+        if let Some(entries) = self.directories()? {
+            for entry in entries {
+                if let Some(dir) = Self::manifest_dir(entry?)?
+                    && read_manifest(&dir)?.source == key
+                    && found.replace(dir).is_some()
+                {
+                    return Err(invalid("ambiguous archived native path"));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Compare an already indexed observation without opening a replay spool.
+    pub(crate) fn matches_source(
+        &self,
+        options: &Options,
+        source: &crate::model::summary::CatalogSource,
+        sidecar: Option<&ClaudeSidecar>,
+    ) -> io::Result<bool> {
+        let Some(native) = self.find_native(options, &source.path)? else {
+            return Ok(false);
+        };
+        Ok(native.ledger == crate::source_carrier::ledger(source)
+            && native.native_id == source.native_id
+            && sidecar.is_none_or(|sidecar| native.sidecar.as_ref() == Some(sidecar)))
+    }
+
+    pub(crate) fn find_native(
+        &self,
+        options: &Options,
+        path: &Path,
+    ) -> io::Result<Option<NativeSource>> {
+        if self.directories()?.is_none() {
+            return Ok(None);
+        }
+        let _guard = self.lock(false)?;
+        let Some(key) = path.to_str() else {
+            return Ok(None);
+        };
+        let Some(dir) = self.native_dir(key)? else {
+            return Ok(None);
+        };
+        let manifest = read_manifest(&dir)?;
+        if manifest.source != key {
+            return Ok(None);
+        }
+        let Some((native, chain, _)) = Self::available(&manifest, options)? else {
+            return Ok(None);
+        };
+        if !self.trusted(&dir, chain) {
+            return Err(invalid("unverified native archive chain"));
+        }
+        Ok(Some(native.clone()))
+    }
+
+    pub(crate) fn open_native(
+        &self,
+        options: &Options,
+        path: &Path,
+    ) -> io::Result<Option<(NativeSource, LogFile)>> {
+        if self.directories()?.is_none() {
+            return Ok(None);
+        }
+        let _guard = self.lock(false)?;
+        let Some(key) = path.to_str() else {
+            return Ok(None);
+        };
+        let Some(dir) = self.native_dir(key)? else {
+            return Ok(None);
+        };
+        let manifest = read_manifest(&dir)?;
+        if manifest.source != key {
+            return Ok(None);
+        }
+        let Some((native, chain, _)) = Self::available(&manifest, options)? else {
+            return Ok(None);
+        };
+        // Supply the seekable parser with a private, unlinked snapshot and verify
+        // the precise bytes it will read, including the original tail witness.
+        let mut file = tempfile::tempfile_in(&self.dir)?;
+        let mut reader = open_chain(&dir, chain)?;
+        let (length, digest) = copy_chain(&mut reader, &mut file, chain.length)?;
+        let width = length.min(crate::events::WINDOW);
+        file.seek(SeekFrom::Start(length - width))?;
+        let mut tail = vec![0; width as usize];
+        file.read_exact(&mut tail)?;
+        if length != chain.length
+            || digest != native.ledger.prefix
+            || <[u8; 32]>::from(Sha256::digest(tail)) != native.ledger.tail
+        {
+            return Err(invalid("native archive differs from its original ledger"));
+        }
+        Ok(Some((native.clone(), LogFile::from_archive(file)?)))
+    }
+
     /// Writes everything `reader` yields as a new, immutable chain of
     /// `source`, durably, and returns it. Bytes that an earlier chain holds
     /// intact (same length, SHA-256 and version) are not written again:
@@ -307,6 +640,7 @@ impl Archive {
         sync_dir(&dir)?;
         let chain = Chain {
             chain_id,
+            admitted_ms: crate::model::now_ms(),
             length,
             sha256,
             stored_bytes,
@@ -330,6 +664,7 @@ impl Archive {
     /// starts and the old one stays. Returns `false`, writing nothing, when
     /// the log no longer holds the consumed bytes (it changed after the
     /// index read it); the next index read admits it.
+    #[cfg(test)]
     pub fn admit(
         &self,
         source: &str,
@@ -337,7 +672,37 @@ impl Archive {
         offset: u64,
         prefix: &[u8; 32],
     ) -> io::Result<bool> {
+        self.admit_inner(source, log, offset, prefix, None)
+    }
+
+    pub(crate) fn admit_native(
+        &self,
+        source: &str,
+        log: &mut LogFile,
+        native: NativeSource,
+    ) -> io::Result<bool> {
+        let prefix = native.ledger.prefix;
+        self.admit_inner(source, log, native.ledger.offset, &prefix, Some(native))
+    }
+
+    fn admit_inner(
+        &self,
+        source: &str,
+        log: &mut (impl Read + Seek),
+        offset: u64,
+        prefix: &[u8; 32],
+        native: Option<NativeSource>,
+    ) -> io::Result<bool> {
         if offset == 0 {
+            if native.is_some() && self.directories()?.is_some() {
+                let _guard = self.lock(true)?;
+                if let Some(dir) = self.native_dir(source)? {
+                    let mut manifest = read_manifest(&dir)?;
+                    if manifest.source == source && manifest.native_current.take().is_some() {
+                        publish(&dir, MANIFEST, &manifest)?;
+                    }
+                }
+            }
             return Ok(true);
         }
         let _guard = self.lock(true)?;
@@ -357,13 +722,18 @@ impl Archive {
         {
             if held.length == offset && held.sha256 == hex(prefix) {
                 self.release_prefix(&held.chain_id);
+                update_native(&dir, &mut manifest, &held.chain_id, native)?;
                 return Ok(true);
             }
             if held.length > offset {
-                if self.matches_prefix(&dir, &held, offset, prefix)? {
+                if native.as_ref().is_none_or(|native| !native.complete)
+                    && self.matches_prefix(&dir, &held, offset, prefix)?
+                {
+                    update_native(&dir, &mut manifest, &held.chain_id, native)?;
                     return Ok(true);
                 }
             } else if held.length < offset
+                && !manifest.seal_pins.contains(&held.chain_id)
                 && let Some(resume) = &held.resume
             {
                 // The chain continues the log when the log's bytes up to its
@@ -372,12 +742,13 @@ impl Archive {
                 let checked = copy_range(log, resume, held.length, offset, &mut io::sink());
                 match checked {
                     Ok((hasher, mark)) if hasher.digest() == *prefix && agrees(&held, mark) => {
-                        let extended =
-                            extend(&dir, &mut manifest, &held, resume, log, offset, prefix)?;
-                        if extended && let Some(chain) = manifest.chains.last() {
-                            self.remember(&dir, chain)?;
+                        if extend(&dir, &mut manifest, &held, resume, log, offset, prefix)? {
+                            set_native(&mut manifest, &held.chain_id, native);
+                            publish(&dir, MANIFEST, &manifest)?;
+                            self.remember(&dir, manifest.chains.last().expect("extended chain"))?;
+                            return Ok(true);
                         }
-                        return Ok(extended);
+                        return Ok(false);
                     }
                     Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
@@ -389,8 +760,11 @@ impl Archive {
             self.release_prefix(&chain.chain_id);
         }
         let begun = begin(&dir, &mut manifest, log, offset, prefix)?;
-        if begun && let Some(chain) = manifest.chains.last() {
-            self.remember(&dir, chain)?;
+        if begun {
+            let chain = manifest.chains.last().expect("new chain").clone();
+            set_native(&mut manifest, &chain.chain_id, native);
+            publish(&dir, MANIFEST, &manifest)?;
+            self.remember(&dir, &chain)?;
         }
         Ok(begun)
     }
@@ -582,6 +956,7 @@ impl Archive {
             // A new directory, or one a crash left before its manifest.
             make_dir(&dir)?;
             sync_dir(&self.dir)?;
+            manifest.version = VERSION;
             manifest.source = source.to_owned();
             publish(&dir, MANIFEST, &manifest)?;
         } else if manifest.source != source {
@@ -631,7 +1006,7 @@ impl Archive {
 
     /// Takes the flock before any in-memory mutex: shared for journal reads,
     /// exclusive for writes (including torn-tail repair).
-    fn lock(&self, exclusive: bool) -> io::Result<Guard> {
+    pub(crate) fn lock(&self, exclusive: bool) -> io::Result<Guard> {
         match fs::symlink_metadata(&self.dir) {
             Ok(meta) if meta.file_type().is_dir() => {}
             Ok(_) => return Err(invalid("the archive is not a directory")),
@@ -698,13 +1073,13 @@ fn begin(
     sync_dir(dir)?;
     manifest.chains.push(Chain {
         chain_id,
+        admitted_ms: crate::model::now_ms(),
         length: offset,
         sha256: hex(prefix),
         stored_bytes,
         redactor_version: NATIVE_REDACTOR.to_owned(),
         resume: Some(hasher.resume()),
     });
-    publish(dir, MANIFEST, manifest)?;
     Ok(true)
 }
 
@@ -748,7 +1123,6 @@ fn extend(
     last.sha256 = hex(prefix);
     last.stored_bytes = file.metadata()?.len();
     last.resume = Some(hasher.resume());
-    publish(dir, MANIFEST, manifest)?;
     Ok(true)
 }
 
@@ -858,8 +1232,13 @@ fn read_some(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
 /// it: ids, digests and the continuation state must be what this module
 /// writes, so a damaged or hostile manifest cannot name another path.
 fn read_manifest(dir: &Path) -> io::Result<Manifest> {
-    let manifest: Manifest = read_json(&dir.join(MANIFEST))?;
-    if manifest.source.is_empty() && !manifest.chains.is_empty() {
+    let Some(manifest): Option<Manifest> = read_json(&dir.join(MANIFEST))? else {
+        return Ok(Manifest::default());
+    };
+    if manifest.version != VERSION {
+        return Err(invalid("unsupported archive manifest version"));
+    }
+    if manifest.source.is_empty() {
         return Err(invalid("an archive manifest that is not what was written"));
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -883,16 +1262,93 @@ fn read_manifest(dir: &Path) -> io::Result<Manifest> {
             return Err(invalid("an archive manifest that is not what was written"));
         }
     }
+    for (id, native) in &manifest.native {
+        let Some(chain) = manifest.chains.iter().find(|chain| &chain.chain_id == id) else {
+            return Err(invalid("archive native observation without a chain"));
+        };
+        if native.input().is_none()
+            || !native.absolute_home.is_absolute()
+            || native.home.join(&native.path).to_str() != Some(manifest.source.as_str())
+            || native.native_id.is_empty()
+            || native.ledger.offset > chain.length
+            || native.ledger.offset > native.ledger.stat.size
+            || (native.complete && !native.matches(chain))
+            || native
+                .sidecar
+                .as_ref()
+                .is_some_and(|sidecar| !sidecar.valid())
+            || chain.redactor_version != NATIVE_REDACTOR
+        {
+            return Err(invalid("invalid archive native observation"));
+        }
+    }
+    if manifest
+        .native_current
+        .as_ref()
+        .is_some_and(|id| !manifest.native.contains_key(id))
+    {
+        return Err(invalid("archive has no current native observation"));
+    }
+    if !manifest
+        .seal_pins
+        .iter()
+        .all(|id| seen.contains(id.as_str()))
+    {
+        return Err(invalid("archive seal pin without a chain"));
+    }
     Ok(manifest)
+}
+
+fn set_native(manifest: &mut Manifest, id: &str, native: Option<NativeSource>) {
+    if let Some(native) = native {
+        manifest.native.insert(id.to_owned(), native);
+        manifest.native_current = Some(id.to_owned());
+    }
+}
+
+fn update_native(
+    dir: &Path,
+    manifest: &mut Manifest,
+    id: &str,
+    native: Option<NativeSource>,
+) -> io::Result<()> {
+    if native.as_ref().is_some_and(|native| {
+        manifest.native_current.as_deref() != Some(id) || manifest.native.get(id) != Some(native)
+    }) {
+        set_native(manifest, id, native);
+        publish(dir, MANIFEST, manifest)?;
+    }
+    Ok(())
+}
+
+fn copy_chain(
+    reader: &mut impl Read,
+    output: &mut impl Write,
+    length: u64,
+) -> io::Result<(u64, [u8; 32])> {
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; BUFFER];
+    let mut reader = reader.take(length.saturating_add(1));
+    let mut bytes = 0;
+    loop {
+        let count = read_some(&mut reader, &mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let chunk = &buffer[..count];
+        hash.update(chunk);
+        output.write_all(chunk)?;
+        bytes += count as u64;
+    }
+    Ok((bytes, hash.finalize().into()))
 }
 
 /// Reads `chain` back whole and checks its length and SHA-256.
 fn check_chain(dir: &Path, chain: &Chain) -> io::Result<()> {
-    let mut hash = Sha256::new();
-    let bytes = io::copy(&mut open_chain(dir, chain)?, &mut HashWriter(&mut hash))?;
+    let (bytes, digest) = copy_chain(&mut open_chain(dir, chain)?, &mut io::sink(), chain.length)?;
     #[cfg(test)]
     VERIFIED_BYTES.with(|total| total.set(total.get() + bytes));
-    if bytes != chain.length || hex(&hash.finalize()) != chain.sha256 {
+    if bytes != chain.length || hex(&digest) != chain.sha256 {
         return Err(invalid(&format!(
             "archive chain {} differs from its manifest",
             chain.chain_id
@@ -908,6 +1364,9 @@ fn open_chain(dir: &Path, chain: &Chain) -> io::Result<impl Read + use<>> {
         return Err(invalid("an archive chain id that is not an id"));
     }
     let file = crate::open_input(&dir.join(format!("{}.zst", chain.chain_id)))?;
+    if file.metadata()?.len() < chain.stored_bytes {
+        return Err(invalid("an archive chain shorter than its manifest"));
+    }
     zstd::stream::read::Decoder::new(file.take(chain.stored_bytes))
 }
 
@@ -929,11 +1388,11 @@ fn random_id() -> io::Result<String> {
     Ok(hex(&bytes))
 }
 
-/// `T::default()` when the file does not exist.
-fn read_json<T: DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
+/// `None` when the file does not exist.
+fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     let file = match crate::open_input(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let mut bytes = Vec::new();
@@ -941,7 +1400,9 @@ fn read_json<T: DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
     if bytes.len() as u64 > METADATA_MAX {
         return Err(invalid("oversized archive metadata"));
     }
-    serde_json::from_slice(&bytes).map_err(|_| invalid("unreadable archive metadata"))
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| invalid("unreadable or unsupported archive metadata"))
 }
 
 /// Writes `value` as `dir/name`: a temporary file, synced, renamed over the

@@ -1306,6 +1306,12 @@ fn scan(
     if selected.is_none() {
         cache.begin_full_scan()?;
     }
+    let archive_options = options.facts.is_none().then_some(options);
+    let archived = if selected.is_none() && archive_options.is_some() {
+        crate::archive::Archive::native_inputs(options)?
+    } else {
+        Vec::new()
+    };
     let projects = options.claude_home.join("projects");
     let mut files = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1323,6 +1329,12 @@ fn scan(
         );
     } else {
         file_list(&projects, &mut paths, "jsonl")?;
+        paths.extend(
+            archived
+                .iter()
+                .filter(|input| input.root == crate::InputRoot::Claude)
+                .map(|input| input.full_path(options)),
+        );
     }
     for path in paths {
         if outside(&path) {
@@ -1368,7 +1380,7 @@ fn scan(
         // Stamped before it is read, so a line that lands during the read
         // counts toward the next version, not this one.
         let stamp = stamp_of(&path);
-        let summary = match events::scan_file(&path, "claude", cache, dirty) {
+        let summary = match events::scan_source(&path, "claude", cache, dirty, archive_options) {
             Ok(summary) => summary,
             Err(error) if selected.is_some() && error.kind() == io::ErrorKind::WouldBlock => {
                 return Err(error);
@@ -1419,6 +1431,12 @@ fn scan(
         for root in crate::inputs::codex_rollout_dirs(options) {
             file_list(&root, &mut paths, "jsonl")?;
         }
+        paths.extend(
+            archived
+                .iter()
+                .filter(|input| input.root == crate::InputRoot::Codex)
+                .map(|input| input.full_path(options)),
+        );
     }
     paths.retain(|path| machine.codex_rollout_is_current(options, path));
     for path in paths {
@@ -1427,7 +1445,7 @@ fn scan(
             continue;
         }
         let stamp = stamp_of(&path);
-        let summary = match events::scan_file(&path, "codex", cache, dirty) {
+        let summary = match events::scan_source(&path, "codex", cache, dirty, archive_options) {
             Ok(summary) => summary,
             Err(error) if selected.is_some() && error.kind() == io::ErrorKind::WouldBlock => {
                 return Err(error);
@@ -1461,7 +1479,9 @@ fn scan(
     let inputs = if let Some(selected) = selected {
         selected.to_vec()
     } else {
-        crate::inputs::inputs(options)?
+        let mut inputs = crate::inputs::inputs(options)?;
+        inputs.extend(archived);
+        inputs
     };
     for input in inputs
         .into_iter()
@@ -1478,11 +1498,20 @@ fn scan(
             .nth(1)
             .expect("allowlisted session identity")
             .to_owned();
-        let Some(_) = crate::copilot::header(&path, &id)? else {
-            continue;
-        };
+        match crate::copilot::header(&path, &id) {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && archive_options.is_some() => {}
+            Err(error) => return Err(error),
+        }
         let stamp = stamp_of(&path);
-        let summary = events::scan_file(&path, "copilot", cache, dirty)?;
+        let summary = match events::scan_source(&path, "copilot", cache, dirty, archive_options) {
+            Ok(summary) => summary,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && archive_options.is_some() => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let stamp = indexed_stamp(cache, &path, stamp);
         if cache.replaced(&path) {
             texts.invalidate(&path);
@@ -1512,7 +1541,16 @@ fn scan(
     // producer's) archive just the sources they scanned, and only the
     // prefix the index consumed so far.
     if options.facts.is_none() {
-        cache.archive_consumed(&options.cache, &seen);
+        for file in &files {
+            if let Some(input) = crate::native_evidence::catalog_input(&file.path, options) {
+                cache.archive_consumed(
+                    options,
+                    input,
+                    &file.id,
+                    file.summary.claude_sidecar.clone(),
+                );
+            }
+        }
     }
     cache.end_scan();
     texts
@@ -1521,12 +1559,18 @@ fn scan(
     Ok((files, skipped, cache.index_clone_duration()))
 }
 
-fn verify_sidecars(files: &[SourceFile]) -> io::Result<()> {
+fn verify_sidecars(options: &Options, files: &[SourceFile]) -> io::Result<()> {
     if files.iter().any(|file| {
-        file.summary
-            .claude_sidecar
-            .as_ref()
-            .is_some_and(|sidecar| !sidecar.current(&file.path))
+        file.summary.claude_sidecar.as_ref().is_some_and(|sidecar| {
+            if sidecar.current(&file.path) {
+                return false;
+            }
+            let source = summary::source(file);
+            options.facts.is_some()
+                || !crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache))
+                    .matches_source(options, &source, Some(sidecar))
+                    .unwrap_or(false)
+        })
     }) {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -7607,7 +7651,7 @@ pub(crate) fn prepare_semantic_index_sources(
         &facts,
         Some(inputs),
     )?;
-    verify_sidecars(&files)?;
+    verify_sidecars(options, &files)?;
     let claims = cache.catalog_claims(&paths)?;
     let proofs = crate::query_source::Sources::capture(
         options,
@@ -7672,7 +7716,7 @@ pub(crate) fn prepare_semantic_index_sources(
         })
         .collect();
     records.finish()?;
-    verify_sidecars(&files)?;
+    verify_sidecars(options, &files)?;
     for withdrawal in &withdrawals {
         if !withdrawal.current()? {
             return Err(io::Error::other(
@@ -8221,7 +8265,11 @@ fn build_sources_inner(
         }
     }
     if history_records.is_none() {
-        measured!("sidecars_before", files.len(), verify_sidecars(&files)?);
+        measured!(
+            "sidecars_before",
+            files.len(),
+            verify_sidecars(options, &files)?
+        );
     }
     let started = measurements.start();
     let claims = if target == BuildTarget::Sources && history_records.is_none() {
@@ -8715,7 +8763,11 @@ fn build_sources_inner(
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::run(options, "runtime_checked");
     if history_records.is_none() {
-        measured!("sidecars_after", files.len(), verify_sidecars(&files)?);
+        measured!(
+            "sidecars_after",
+            files.len(),
+            verify_sidecars(options, &files)?
+        );
     }
     if matches!(target, BuildTarget::Catalog | BuildTarget::Sources) && history_records.is_none() {
         measured!("source_finish", files.len(), source_records.finish()?);
@@ -8996,7 +9048,7 @@ fn build_sources_inner(
         hook();
     }
     if history_records.is_none() {
-        verify_sidecars(&files)?;
+        verify_sidecars(options, &files)?;
         source_records.finish()?;
     }
     drop(source_records);

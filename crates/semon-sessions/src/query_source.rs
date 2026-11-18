@@ -44,6 +44,7 @@ pub(crate) struct Sources {
     proofs: BTreeMap<PathBuf, Proof>,
     paths: BTreeMap<(String, String), PathBuf>,
     diagnostic_scope: PathBuf,
+    archive_options: Option<Options>,
     #[cfg(feature = "test-hooks")]
     cache: PathBuf,
 }
@@ -83,6 +84,7 @@ impl Sources {
             proofs: BTreeMap::new(),
             paths: BTreeMap::new(),
             diagnostic_scope: crate::events::EventCache::path(&options.cache),
+            archive_options: options.facts.is_none().then(|| options.clone()),
             #[cfg(feature = "test-hooks")]
             cache: options.cache.clone(),
         }
@@ -317,6 +319,7 @@ impl Sources {
             provider,
             mode,
             remote: Mutex::default(),
+            archived: Mutex::default(),
             checked: Mutex::default(),
             checked_chunks: Mutex::default(),
             checked_evidence: Mutex::default(),
@@ -339,6 +342,7 @@ pub(crate) struct Records<'a> {
     provider: Option<&'a dyn SessionSourceReader>,
     mode: crate::SessionSourceReadMode,
     remote: Mutex<BTreeMap<PathBuf, (String, u64)>>,
+    archived: Mutex<BTreeMap<PathBuf, LogFile>>,
     checked: Mutex<BTreeMap<PathBuf, Stat>>,
     checked_chunks: Mutex<BTreeMap<PathBuf, BTreeSet<usize>>>,
     checked_evidence: Mutex<BTreeMap<PathBuf, BTreeSet<crate::native_record::Record>>>,
@@ -362,6 +366,54 @@ struct PreparedBlock {
 }
 
 impl Records<'_> {
+    fn with_archive<T>(
+        &self,
+        path: &Path,
+        proof: &Proof,
+        read: impl FnOnce(&mut LogFile) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let Some(options) = &self.sources.archive_options else {
+            return Ok(None);
+        };
+        // Keep independently authorized providers and a request's already
+        // accepted native carrier on their original paths.
+        if self.provider.is_some() {
+            return Ok(None);
+        }
+        let mut archived = self.archived.lock().map_err(|_| unavailable())?;
+        if let Some(file) = archived.get_mut(path) {
+            if !matches!(crate::open_input(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(unavailable());
+            }
+            return read(file).map(Some);
+        }
+        if self
+            .checked
+            .lock()
+            .map_err(|_| unavailable())?
+            .contains_key(path)
+            || !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(None);
+        }
+        let archive = crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache));
+        let Some((native, mut file)) = archive.open_native(options, path)? else {
+            return Ok(None);
+        };
+        let reference = proof.source.as_ref().ok_or_else(unavailable)?;
+        if native.ledger != proof.ledger
+            || native.root != reference.root
+            || native.path != reference.path
+            || native.native_id != reference.native_id
+        {
+            return Err(unavailable());
+        }
+        let value = read(&mut file)?;
+        archived.insert(path.to_owned(), file);
+        Ok(Some(value))
+    }
+
     // Preserve the first physical revision failure even when a presentation
     // parser tolerates a missing record. No partial answer may hide this fence.
     fn reject_revision(&self, reason: crate::source_carrier::RevisionReason) -> io::Error {
@@ -490,6 +542,12 @@ impl Records<'_> {
             {
                 return Err(unavailable());
             }
+            let mut read = Some(read);
+            if let Some(value) =
+                self.with_archive(path, proof, |file| read.take().expect("one carrier")(file))?
+            {
+                return Ok(value);
+            }
             self.verify(path, proof)?;
             let mut file = LogFile::open(path)?;
             let before = Stat::from_metadata(&file.metadata()?)?;
@@ -506,7 +564,7 @@ impl Records<'_> {
             {
                 return Err(unavailable());
             }
-            let value = read(&mut file)?;
+            let value = read.expect("unused native reader")(&mut file)?;
             if qualified {
                 self.recheck(path, &file, &before)?;
             }
@@ -626,6 +684,9 @@ impl Records<'_> {
     }
 
     fn verify(&self, path: &Path, proof: &Proof) -> io::Result<()> {
+        if self.with_archive(path, proof, |_| Ok(()))?.is_some() {
+            return Ok(());
+        }
         if self.provider.is_some()
             && (matches!(self.mode, crate::SessionSourceReadMode::ProviderOnly)
                 || self.pinned_provider(path)?)
@@ -744,6 +805,12 @@ impl Records<'_> {
                 chunks
                     .clear_cache()
                     .map_err(|error| self.proof_failure(path, error))?;
+            }
+        }
+        for path in self.archived.lock().map_err(|_| unavailable())?.keys() {
+            if !matches!(crate::open_input(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(unavailable());
             }
         }
         let paths: Vec<_> = self
@@ -878,6 +945,20 @@ impl Records<'_> {
                 || self.pinned_provider(path)?)
         {
             return self.provider_range(path, proof, offset, max, prepare);
+        }
+        if let Some(bytes) = self.with_archive(path, proof, |file| {
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = vec![0; max];
+            file.read_exact(&mut bytes)?;
+            Ok(bytes)
+        })? {
+            return Ok(SessionSourceRange {
+                generation: proof.generation.clone(),
+                length: proof.ledger.offset,
+                offset,
+                bytes: Arc::from(bytes),
+                cached: true,
+            });
         }
         let mut prepared = Some(self.prepared.lock().map_err(|_| unavailable())?);
         let cached_file = prepared

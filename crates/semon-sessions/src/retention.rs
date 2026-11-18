@@ -351,6 +351,8 @@ pub fn retain_source_event_index(
     use CatalogIdentityError::{InvalidArguments, ScopeChanged, Unavailable};
     let path = archive_index_path(options, proof, projection)?;
     let full = path.to_str().ok_or(InvalidArguments)?;
+    let archive = crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache));
+    let _archive_lock = archive.lock(true).map_err(|_| Unavailable)?;
     let mut connection = Connection::open_with_flags(
         EventCache::path(&options.cache),
         OpenFlags::SQLITE_OPEN_READ_WRITE
