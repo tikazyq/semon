@@ -111,10 +111,12 @@ same archive after every batch or restart; see the
 `semon receive` is a receiver for `semon push`, for one person with several machines, and the [push protocol](docs/push-protocol.md)'s reference implementation (`semon_push::mirror::Receiver`). Each machine pushes with its own token, and its copy lands in `DIR/machines/NAME/`: `claude/` and `codex/` hold the input files at their paths under each home, and `facts.json` holds the machine's facts. A token decides the machine, so one machine's token can't write another's files.
 
 The receiver can listen on plain HTTP behind an HTTPS proxy such as Cloudflare
-Tunnel. Start it and print a one-time code on the receiver host:
+Tunnel. Forward `https://receiver.example` to `http://127.0.0.1:8080`, preserving the public
+`Host` header. Start the receiver and print a one-time code on the receiver host:
 
 ```sh
-semon receive --dir ~/semon-received --listen 0.0.0.0:8080
+semon receive --dir ~/semon-received --listen 127.0.0.1:8080 \
+  --public-url https://receiver.example
 # In another terminal on that host:
 semon pair --dir ~/semon-received
 ```
@@ -171,12 +173,33 @@ semon receive name machine-6754a9c1e83f27b4 --clear --dir ~/semon-machines
 ```
 
 Use the complete generated ID from the listing. Name changes are audited in the
-same registry transaction. Registry format 7 refuses older state explicitly;
+same registry transaction. Registry format 8 refuses older state explicitly;
 keep that directory unchanged and re-enroll into a new receiver directory.
 A received directory without a machine record is skipped with a re-enrollment warning; recorded machines remain available;
 Semon never deletes or moves retained logs.
 
-To see the received machines, serve `DIR` with `semon sessions --serve --machines DIR` ([See all your machines](#see-all-your-machines)).
+### Open received history on the same port
+
+Create an owner read token on the receiver host after starting `semon receive`:
+
+```sh
+semon token --dir ~/semon-received
+semon token --dir ~/semon-received --list
+semon token --dir ~/semon-received --revoke ID
+```
+
+Creation prints `ID TOKEN` once. Open `https://receiver.example/?t=TOKEN` in your
+browser. The receiver sets an HTTPS-only session
+cookie and redirects to the same page with the token removed. API clients can
+send `Authorization: Bearer TOKEN`. Revoking the ID blocks both the token and
+its cookies on the next request. Restarting the receiver clears browser sessions.
+These read tokens only open the Viewer for received history. Machine push tokens
+and one-time pair codes have separate permissions.
+
+The proxy and browser see the login URL. Keep it private and omit query strings
+from proxy access logs. The Receiver Viewer accepts the configured public Host
+and matching Origin, plus loopback on the listen port. For a local Viewer that
+combines those machines with this machine's sessions, see the setup below.
 
 ## See all your machines
 

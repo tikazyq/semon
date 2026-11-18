@@ -65,6 +65,7 @@ impl Harness {
             admission: Mutex::new(Admission::default()),
             body: None,
             provisioning: Some(Arc::new(Mutex::new(controller))),
+            viewer: None,
             provisioning_clock: Some(Arc::new(move || clock_hook.load(Ordering::Relaxed))),
             provisioning_timeout: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             provisioning_terminal: Some(Arc::new(move |id, code| {

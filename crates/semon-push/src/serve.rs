@@ -1,6 +1,6 @@
 //! `semon receive`'s listener: the push protocol over HTTP/1.1, plain on
 //! a proxy-facing address or TLS with an operator-supplied certificate and key. It serves
-//! push routes to [`Receiver`], protected provisioning, and the closed reverse
+//! the received-history Viewer, push routes to [`Receiver`], protected provisioning, and the closed reverse
 //! body poll/response routes when body custody is configured.
 //!
 //! Each connection has its own thread, up to [`Limits::connections`] in
@@ -9,7 +9,9 @@
 //! [`Limits::connections_per_ip`]; one more over either is closed as soon
 //! as it is accepted. Once authenticated, it counts only in the total, so
 //! several machines behind one address (an SSH tunnel, a NAT) each keep
-//! their connection. A request's token is checked, and its
+//! their connection. Viewer requests use a separate share of the total and
+//! release the address allowance when assigned a Viewer slot. A push request's
+//! token is checked, and its
 //! declared length against [`MAX_BODY_BYTES`], before any of its body is
 //! read. Every read and write of the socket, the TLS handshake's included,
 //! runs against a deadline (see [`Limits`]), so a client that trickles bytes
@@ -33,6 +35,8 @@ use serde_json::{Value, json};
 mod auth;
 #[path = "serve_body.rs"]
 mod body;
+#[path = "serve_viewer.rs"]
+mod viewer;
 use crate::credentials::Kind;
 use auth::Authenticator;
 pub use auth::{
@@ -54,6 +58,8 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8735";
 pub const HEAD_MAX_BYTES: usize = 16 * 1024;
 /// The most header lines in one request.
 const MAX_HEADERS: usize = 64;
+/// Maximum Viewer share of the receiver's connections.
+const VIEWER_CONNECTIONS: usize = 4;
 /// What an early close reads and drops at most, so the client gets the
 /// answer rather than a reset.
 const LINGER_BYTES: usize = 256 * 1024;
@@ -144,6 +150,8 @@ pub struct ServeOptions {
     pub dir: PathBuf,
     pub listen: SocketAddr,
     pub tls: Option<TlsFiles>,
+    /// Public Viewer origin when a proxy terminates HTTPS.
+    pub public_url: Option<String>,
     /// The most bytes one machine's copy may hold ([`DEFAULT_MAX_BYTES`]).
     pub max_bytes: u64,
 }
@@ -156,6 +164,7 @@ impl ServeOptions {
             dir: dir.into(),
             listen: DEFAULT_LISTEN.parse().expect("the default address parses"),
             tls: None,
+            public_url: None,
             max_bytes: DEFAULT_MAX_BYTES,
         }
     }
@@ -166,6 +175,7 @@ impl ServeOptions {
 struct Admission {
     open: usize,
     provisioning: usize,
+    viewers: usize,
     per_ip: HashMap<IpAddr, usize>,
 }
 
@@ -182,6 +192,7 @@ struct Shared {
     admission: Mutex<Admission>,
     body: Option<crate::body_host::BodyHost<'static>>,
     provisioning: Option<Arc<Mutex<crate::provision::Controller>>>,
+    viewer: Option<viewer::Viewer>,
     #[cfg(test)]
     provisioning_clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     #[cfg(test)]
@@ -204,6 +215,7 @@ struct Slot {
     /// The address it counts against, until it authenticates.
     ip: Option<IpAddr>,
     provisioning: bool,
+    viewer: bool,
 }
 
 fn release_ip(admission: &mut Admission, ip: IpAddr) {
@@ -231,6 +243,7 @@ impl Slot {
             shared: Arc::clone(shared),
             ip: Some(ip),
             provisioning: false,
+            viewer: false,
         })
     }
 
@@ -244,6 +257,22 @@ impl Slot {
         }
         admission.provisioning += 1;
         self.provisioning = true;
+        true
+    }
+
+    /// Viewer requests use one connection each. Move a classified read out of
+    /// the peer's initial admission pool before it can block on I/O or indexing.
+    fn admit_viewer(&mut self) -> bool {
+        let mut admission = self.shared.admission();
+        // Keep a connection available to pushes even under the smallest limits.
+        if admission.viewers >= VIEWER_CONNECTIONS.min(self.shared.limits.connections - 1) {
+            return false;
+        }
+        admission.viewers += 1;
+        if let Some(ip) = self.ip.take() {
+            release_ip(&mut admission, ip);
+        }
+        self.viewer = true;
         true
     }
 
@@ -263,6 +292,9 @@ impl Drop for Slot {
         if self.provisioning {
             admission.provisioning -= 1;
         }
+        if self.viewer {
+            admission.viewers -= 1;
+        }
         if let Some(ip) = self.ip.take() {
             release_ip(&mut admission, ip);
         }
@@ -278,12 +310,18 @@ pub struct Server {
     tls: Option<Arc<rustls::ServerConfig>>,
     limits: Limits,
     provisioning: Option<Arc<Mutex<crate::provision::Controller>>>,
+    viewer: viewer::Viewer,
 }
 
 impl Server {
     /// Checks the options and the directory (created 0700 when missing; an
     /// existing one others can read is refused), and binds.
     pub fn bind(options: &ServeOptions) -> Result<Self, String> {
+        let public = options
+            .public_url
+            .as_deref()
+            .map(viewer::PublicOrigin::parse)
+            .transpose()?;
         let dir = &options.dir;
         crate::simple_pair::initialize(dir)?;
         let tokens = Authenticator::open(dir)?;
@@ -295,6 +333,11 @@ impl Server {
             .transpose()?;
         let listener = TcpListener::bind(options.listen)
             .map_err(|error| format!("cannot listen on {}: {error}", options.listen))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let viewer = viewer::Viewer::new(dir, port, tls.is_some(), public)?;
         Ok(Self {
             listener,
             credential_count,
@@ -305,6 +348,7 @@ impl Server {
             tls,
             limits: Limits::default(),
             provisioning: None,
+            viewer,
         })
     }
 
@@ -363,6 +407,7 @@ impl Server {
             admission: Mutex::new(Admission::default()),
             body,
             provisioning: self.provisioning,
+            viewer: Some(self.viewer),
             #[cfg(test)]
             provisioning_clock: None,
             #[cfg(test)]
@@ -593,6 +638,22 @@ struct Head {
     expect_other: bool,
     authorization: Option<String>,
     content_type: Option<String>,
+    viewer_headers: Vec<(String, String)>,
+}
+
+impl Head {
+    fn viewer_header(&self, name: &str) -> Result<Option<&str>, ()> {
+        let mut values = self
+            .viewer_headers
+            .iter()
+            .filter_map(|(key, value)| (key == name).then_some(value.as_str()));
+        let value = values.next();
+        if values.next().is_some() {
+            Err(())
+        } else {
+            Ok(value)
+        }
+    }
 }
 
 /// Why no request head was read.
@@ -697,8 +758,14 @@ impl Connection {
 
     /// Writes `bytes`, within [`Limits::write`].
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.send_parts(&[bytes])
+    }
+
+    fn send_parts(&mut self, parts: &[&[u8]]) -> io::Result<()> {
         self.stream.timed().deadline = Instant::now() + self.limits.write;
-        self.stream.write_all(bytes)?;
+        for part in parts {
+            self.stream.write_all(part)?;
+        }
         self.stream.flush()
     }
 
@@ -773,6 +840,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
@@ -851,7 +919,8 @@ fn parse_head(bytes: &[u8]) -> Result<Head, (u16, &'static str)> {
             return Err(MALFORMED);
         }
         let value = value.trim_matches([' ', '\t']);
-        match name.to_ascii_lowercase().as_str() {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
             "content-length" => {
                 if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                     return Err(MALFORMED);
@@ -890,6 +959,9 @@ fn parse_head(bytes: &[u8]) -> Result<Head, (u16, &'static str)> {
                     return Err(MALFORMED);
                 }
                 head.authorization = Some(value.to_owned());
+            }
+            "host" | "origin" | "cookie" | "if-none-match" => {
+                head.viewer_headers.push((name, value.to_owned()));
             }
             _ => {}
         }
@@ -954,6 +1026,7 @@ fn serve_connection(slot: &mut Slot, socket: TcpStream, accepted: Instant) {
         match answer(shared, slot, &mut connection, &head) {
             Next::Continue if !head.close => {}
             Next::Continue | Next::Close => return connection.close(),
+            Next::Drop => return,
             Next::Refuse(status, message, headers) => {
                 return connection.refuse(status, message, headers);
             }
@@ -967,6 +1040,8 @@ enum Next {
     /// The connection can't go on (its body was cut short, or the answer
     /// couldn't be written).
     Close,
+    /// Admission refused. Release the peer allowance without lingering.
+    Drop,
     /// Answer this and close, the body unread.
     Refuse(u16, &'static str, &'static [(&'static str, &'static str)]),
 }
@@ -1214,7 +1289,11 @@ fn answer_provisioning(slot: &mut Slot, connection: &mut Connection, head: &Head
 
 fn answer_pair(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &Head) -> Next {
     let refused = || Next::Refuse(403, "pairing refused", &[]);
-    if head.method != "POST" || head.transfer_encoding || head.expect_other {
+    if head.method != "POST"
+        || head.transfer_encoding
+        || head.expect_other
+        || (head.target == "/v1/pair" && head.authorization.is_some())
+    {
         return refused();
     }
     let Some(length) = head.content_length.filter(|n| *n <= 8192) else {
@@ -1260,6 +1339,20 @@ fn answer(shared: &Shared, slot: &mut Slot, connection: &mut Connection, head: &
     }
     if head.target.starts_with("/v1/provision/") || head.target.starts_with("/v1/renew/") {
         return answer_provisioning(slot, connection, head);
+    }
+    let path = head
+        .target
+        .split_once('?')
+        .map_or(head.target.as_str(), |(path, _)| path);
+    if path != "/v1"
+        && !path.starts_with("/v1/")
+        && let Some(viewer) = &shared.viewer
+    {
+        if !slot.admit_viewer() {
+            let _ = viewer::error(connection, 503, "Viewer busy");
+            return Next::Drop;
+        }
+        return viewer.answer(connection, head);
     }
     if head.transfer_encoding {
         return Next::Refuse(

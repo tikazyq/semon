@@ -92,6 +92,7 @@ enum Command {
     Sessions(SessionsArgs),
     Push(PushArgs),
     Pair(Vec<String>),
+    Token(Vec<String>),
     Unpair(Vec<String>),
     Connect {
         endpoint: String,
@@ -297,6 +298,7 @@ fn parse_args() -> Result<Command, String> {
         }
         Some("push") => parse_push_args(arguments).map(Command::Push),
         Some("pair") => Ok(Command::Pair(arguments.collect())),
+        Some("token") => Ok(Command::Token(arguments.collect())),
         Some("unpair") => Ok(Command::Unpair(arguments.collect())),
         Some("receive") => parse_receive_args(arguments).map(Command::Receive),
         Some("query") => parse_query_command(arguments),
@@ -1072,6 +1074,7 @@ fn parse_receive_args(arguments: impl Iterator<Item = String>) -> Result<Receive
     let mut machine = None;
     let mut dir = None;
     let mut listen = semon_push::serve::DEFAULT_LISTEN.to_owned();
+    let mut public_url = None;
     let mut certificate = None;
     let mut private_key = None;
     let mut max_bytes = semon_push::mirror::DEFAULT_MAX_BYTES;
@@ -1084,6 +1087,7 @@ fn parse_receive_args(arguments: impl Iterator<Item = String>) -> Result<Receive
         match argument.as_str() {
             "--dir" => dir = Some(PathBuf::from(value()?)),
             "--listen" => listen = value()?,
+            "--public-url" if !enroll => public_url = Some(value()?),
             "--tls-cert" => certificate = Some(PathBuf::from(value()?)),
             "--tls-key" => private_key = Some(PathBuf::from(value()?)),
             "--max-bytes" => max_bytes = parse_size(&value()?)?,
@@ -1109,6 +1113,7 @@ fn parse_receive_args(arguments: impl Iterator<Item = String>) -> Result<Receive
         dir,
         listen,
         tls,
+        public_url,
         max_bytes,
     };
     if enroll {
@@ -1336,6 +1341,7 @@ fn run(command: Command) -> Result<(), String> {
         Command::Sessions(args) => run_sessions(args),
         Command::Push(args) => run_push(&args),
         Command::Pair(args) => run_pair(&args),
+        Command::Token(args) => run_token(&args),
         Command::Unpair(args) => run_unpair(&args),
         Command::Connect {
             endpoint,
@@ -1690,6 +1696,31 @@ fn run_pair(args: &[String]) -> Result<(), String> {
         _ => Err("Usage: semon pair --dir DIR | semon pair URL CODE".into()),
     }
 }
+fn run_token(args: &[String]) -> Result<(), String> {
+    use semon_push::{read_tokens, simple_pair};
+    match args {
+        [flag, dir] if flag == "--dir" => {
+            let dir = Path::new(dir);
+            simple_pair::initialize(dir)?;
+            let (id, token) =
+                read_tokens::create(dir, simple_pair::now()?).map_err(|error| error.to_string())?;
+            println!("{id} {}", token.expose());
+        }
+        [flag, dir, list] if flag == "--dir" && list == "--list" => {
+            for token in read_tokens::list(Path::new(dir)).map_err(|error| error.to_string())? {
+                let state = if token.revoked { "revoked" } else { "active" };
+                println!("{} {state}", token.id);
+            }
+        }
+        [flag, dir, revoke, id] if flag == "--dir" && revoke == "--revoke" => {
+            read_tokens::revoke(Path::new(dir), id, simple_pair::now()?)
+                .map_err(|error| error.to_string())?;
+        }
+        _ => return Err("Usage: semon token --dir DIR [--list | --revoke ID]".into()),
+    }
+    Ok(())
+}
+
 fn run_unpair(args: &[String]) -> Result<(), String> {
     match args {
         [] => semon_push::simple_pair::unpair_machine(),
@@ -2481,7 +2512,8 @@ fn analytics_usage() -> String {
 }
 
 fn usage() -> String {
-    "Usage: semon receive --dir DIR [--listen ADDR]\n\
+    "Usage: semon receive --dir DIR [--listen ADDR] [--public-url HTTPS_ORIGIN]\n\
+         Usage: semon token --dir DIR [--list | --revoke ID]\n\
          Usage: semon pair --dir DIR\n\
          Usage: semon pair URL CODE\n\
          Usage: semon unpair [MACHINE_ID --dir DIR]\n\
@@ -2529,7 +2561,7 @@ fn usage() -> String {
          Usage: semon archive prune [--retention-days N] [--cache PATH]\n\
          Explicit archive maintenance. Omit retention to keep every chain indefinitely; native logs are never deleted.\n\
          \n\
-         Usage: semon receive --dir DIR [--listen ADDR] [--tls-cert PEM --tls-key PEM] [--max-bytes SIZE]\n\
+         Usage: semon receive --dir DIR [--listen ADDR] [--public-url HTTPS_ORIGIN] [--tls-cert PEM --tls-key PEM] [--max-bytes SIZE]\n\
          Usage: semon receive enroll --machine NAME --advertise HTTPS_URL --dir DIR [--listen ADDR] --tls-cert PEM --tls-key PEM\n\
          Usage: semon receive machines --dir DIR\n\
          Usage: semon receive name ID NAME --dir DIR\n\

@@ -230,3 +230,54 @@ fn plain_http_is_only_accepted_on_loopback_and_redirects_are_disabled() {
         assert!(crate::check_url(url).is_ok());
     }
 }
+
+#[test]
+fn owner_read_tokens_are_transactional_and_separate_from_pairing() {
+    use crate::read_tokens;
+    let f = Fixture::new();
+    let (code, _) = issue(&f.0, 100).unwrap();
+    let paired = f.request(code.expose(), 101).unwrap();
+    let (id, secret) = read_tokens::create(&f.0, 102).unwrap();
+    let (other_id, other_secret) = read_tokens::create(&f.0, 103).unwrap();
+    let mut store = Store::open(&f.0).unwrap();
+    let active = store.snapshot().unwrap();
+    assert_eq!(active.read_token_id(secret.expose()), Some(id.as_str()));
+    assert!(active.read_token_active(&id));
+    assert!(active.read_token_id(&paired.token).is_none());
+    assert!(active.read_token_id(code.expose()).is_none());
+    assert!(!f.accepts(secret.expose()));
+
+    read_tokens::revoke(&f.0, &id, 104).unwrap();
+    let current = store.snapshot().unwrap();
+    assert!(current.read_token_id(secret.expose()).is_none());
+    assert!(!current.read_token_active(&id));
+    assert_eq!(
+        current.read_token_id(other_secret.expose()),
+        Some(other_id.as_str())
+    );
+    assert!(f.accepts(&paired.token));
+    assert!(read_tokens::revoke(&f.0, &id, 105).is_err());
+    assert!(matches!(
+        store.commit(current.revision(), &active),
+        Err(Error::Terminal)
+    ));
+    let bytes = std::fs::read(f.0.join("enrollment/registry.json")).unwrap();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    assert!(!raw.contains(secret.expose()));
+    assert!(!raw.contains(other_secret.expose()));
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let events = json["read_tokens"]["audit"].as_array().unwrap();
+    assert_eq!(
+        events[0],
+        serde_json::json!({"id": id, "time": 102, "action": "created"})
+    );
+    assert_eq!(
+        events[2],
+        serde_json::json!({"id": id, "time": 104, "action": "revoked"})
+    );
+    json["format"] = serde_json::json!(7);
+    assert!(matches!(
+        Registry::parse(&serde_json::to_vec(&json).unwrap()),
+        Err(Error::UnsupportedVersion)
+    ));
+}

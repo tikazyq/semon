@@ -61,13 +61,42 @@ define the current persisted identity and display contract. [C6]
 
 ## Reads and audit
 
-The receiver authorizes and audits reads locally, using its retained custody and
-authenticated loopback Viewer boundary. The origin does not approve or audit each
-receiver read. No online origin assertion, pull-body cache, or dual audit is part
-of this default. Local read/audit integration remains implementation work; this
-amendment chooses no new journal format or authentication protocol. In this
-release only the receiver's OS owner reads, through the authenticated loopback
-Viewer, CLI and MCP; no login or multi-user ACL is added. [C1, C2, C6, I]
+The receiver authorizes reads using retained custody. The origin does not approve
+or audit individual reads. Local query and evidence audit remains implementation
+work. The receiver OS owner can issue revocable tokens for the received-history
+Viewer on the same listener that accepts pushes. CLI and MCP stay local. Tokens
+carry owner-level Viewer access, with no user accounts or per-machine read ACLs.
+[C1, C2, C6, I]
+
+Run `semon receive --dir DIR --listen 127.0.0.1:8080 --public-url
+https://receiver.example` behind a tunnel or reverse proxy that terminates HTTPS
+and forwards the public `Host` unchanged. The Viewer matches that exact authority
+and same-origin `Origin` when present. Loopback authorities on the listen port
+remain available. Cookie-authenticated Home POSTs require a matching Origin.
+The proxy has access to credentials and history in transit. Disable query-string
+logging on the proxy when using browser bootstrap URLs.
+
+`semon token --dir DIR` issues the owner's read Bearer. `--list` reports IDs and
+status, and `--revoke ID` revokes one token. Both mutations append audit entries
+in the same registry transaction. Format 8 stores token hashes and revocation
+state alongside the separate machine push and pairing records. Older formats
+are refused without migration. Keep prior state and logs in place, and use a
+fresh directory to pair again.
+
+`GET /?t=TOKEN` exchanges the credential for the Viewer session cookie and
+redirects to `/`. The HTTPS public origin makes the cookie `Secure`. The cookie
+contains the token ID and a signature keyed to the running receiver. Each request
+rechecks the registry, so revocation covers both Bearer and cookie access.
+Restarting the receiver invalidates existing cookies. Viewer reads use the
+existing received-machine discovery and read routes, with the existing response
+security headers and no-store caching. They serve received sources only.
+
+The receiver classifies Viewer traffic after parsing the bounded request head.
+Viewer requests occupy at most four of the 32 default connection slots and
+release the initial per-peer allowance once assigned to that pool. Each Viewer
+response closes its connection. Pushes retain their existing per-peer admission,
+request timeouts and keep-alive behavior. The initial head limit still applies
+to connections that have yet to identify their route.
 
 ## Four-action journey
 
@@ -104,7 +133,7 @@ These are implementation slices; PR1a implements the owner decisions below.
 | 1b | Unified `harness:native@machine-id` addressing for all sessions and no silent same-ID drop. | C6, M, I |
 | 1c | Proven-duplicate accounting and a receiver-wide refusal cap beside the per-machine cap. Preserve both source rows and mirror source/archive integrity. | C6, M, I |
 | 2 | Received-machine indexing/materialization. Reuse [`ReceivedMachines`](../../crates/semon-sessions/src/received.rs) discovery and `SqliteAnalyticsInput` via [`analytics_writer.rs`](../../crates/semon-sessions/src/analytics_writer.rs). [`parse_materialize_args`](../../crates/semon-cli/src/main.rs) currently refuses `--machine`; this is a real integration gap. | C1, I |
-| 3 | Receiver SQL/search/evidence and local authorization/audit. [`body_query.rs`](../../crates/semon-sessions/src/body_query.rs) currently refuses `Access::Receiver` in `admit`; its search/view worker already accepts multiple indexes. Viewer machine aggregation exists in [`union.rs`](../../crates/semon-sessions/src/union.rs) and [`overview.rs`](../../crates/semon-sessions/src/overview.rs); it is not proof of receiver ASI SQL delivery. Readers are the loopback owner only (C6). | C1, I |
+| 3 | Receiver SQL/search/evidence and local authorization/audit. [`body_query.rs`](../../crates/semon-sessions/src/body_query.rs) currently refuses `Access::Receiver` in `admit`; its search/view worker already accepts multiple indexes. Viewer machine aggregation exists in [`union.rs`](../../crates/semon-sessions/src/union.rs) and [`overview.rs`](../../crates/semon-sessions/src/overview.rs); it is not proof of receiver ASI SQL delivery. CLI and MCP readers remain local to the receiver owner (C6). | C1, I |
 | 4 | Four-action lifecycle and consent wording: combined trust/custody/source interaction, automatic push, integrated receiver/index/materializer/Viewer lifecycle. Keep enrollment, TLS and renewal. | C4, C5, M |
 | 5 | After the switch and a dependency pass, remove federation runtime: #594 body channel, #593 publication objects/heads/egress handles, #595 receiver body cache/dual audit, and `analytics_publish`/`body_channel` credential kinds. Candidates include `origin_read`, `body_*`, `handle_resolver`, `egress`, `objects` and publication paths. Preserve enrollment, mTLS, renewal, mirror, archive custody, ASI projection/store/query and local read audit. No dormant federation mode or compatibility layer. | C2, M, I |
 
@@ -121,7 +150,7 @@ multi-user or third-party receiver can revisit it without dormant runtime. [C2, 
 | A. Duplicate sessions across machines | Count once only when native identity/provenance proves duplication; keep both source records; report divergent same-ID copies. |
 | B. Received-machine identity | Origin-generated canonical `machine-<8 hex Unix seconds><8 secure random hex>` ID; hostname/optional owner-name display. Shared owner names group presentation only. No merge, link or unlink. See PR1a below. |
 | C. Receiver storage | Keep the configurable per-machine cap and add a receiver-wide cap. Both refuse uploads with a clear message; nothing is deleted automatically. Default values are proposed in the implementing PR. |
-| D. Readers in this release | Receiver OS owner only, through the authenticated loopback Viewer, CLI and MCP. |
+| D. Readers in this release | Receiver OS owner via local CLI and MCP, standalone loopback Viewer, or owner-issued read tokens for the received-history Viewer. |
 
 ## PR1a owner decisions (2026-11-15, amended)
 
@@ -132,7 +161,7 @@ multi-user or third-party receiver can revisit it without dormant runtime. [C2, 
   regardless of mode, without following a final symlink.
 - `connect` includes this ID in the committed pairing input, authenticated by the
   existing transcript and proof. The origin stores no additional identity state.
-- Registry format 7 retains `{id, directory, owner_name}` plus pairing state; `directory` equals the ID.
+- Registry format 8 retains `{id, directory, owner_name}` plus pairing state; `directory` equals the ID.
   Receiver storage is `machines/<machine-id>/`. Old state is refused: keep retained
   logs unchanged and re-enroll in a fresh receiver directory. No migration or deletion.
 - `receive enroll --machine NAME` supplies the starting owner display name only.

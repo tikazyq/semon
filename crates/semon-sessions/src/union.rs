@@ -1231,7 +1231,7 @@ impl ViewerCore {
             return self.catalog(&views, path, query, deadline, allow_catalog_wait);
         }
         if views.is_empty() {
-            return text(404, "Not found");
+            return crate::viewer::static_reply(path).unwrap_or_else(|| text(404, "Not found"));
         }
         if let Some(reply) = self.page_at_once(&views, path) {
             return reply;

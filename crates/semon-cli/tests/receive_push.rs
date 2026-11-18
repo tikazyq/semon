@@ -98,10 +98,16 @@ impl Fixture {
 
     /// Starts `semon receive` on a free loopback port and returns its URL.
     fn start_receiver(&mut self) -> String {
+        self.start_receiver_with(&[])
+    }
+
+    fn start_receiver_with(&mut self, args: &[&str]) -> String {
         let mut child = semon()
             .args(["receive", "--listen", "127.0.0.1:0", "--dir"])
             .arg(self.dir())
+            .args(args)
             .env("HOME", self.path("home"))
+            .env("XDG_STATE_HOME", self.path("state"))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -673,4 +679,166 @@ fn pair_and_unpair_commands_store_replace_and_revoke_configuration() {
     assert_ok(&output, "offline unpair");
     assert!(stderr(&output).contains("warning: receiver unreachable"));
     assert!(!pair_path.exists());
+}
+
+#[test]
+fn receive_serves_owner_reads_and_machine_pushes_on_one_port() {
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpStream},
+    };
+    const PUBLIC: &str = "https://receiver.example:8443";
+    const HOST: &str = "Host: receiver.example:8443\r\n";
+    let mut fixture = Fixture::new();
+    let url = fixture.start_receiver_with(&["--public-url", PUBLIC]);
+    let address = url.strip_prefix("http://").unwrap();
+    let connect = || {
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        stream
+    };
+    let request = |method: &str, target: &str, headers: &str, body: &str| {
+        let mut stream = connect();
+        write!(stream, "{method} {target} HTTP/1.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+    let token = |args: &[&str]| {
+        let output = semon()
+            .args(["token", "--dir"])
+            .arg(fixture.dir())
+            .args(args)
+            .output()
+            .unwrap();
+        assert_ok(&output, "owner token command");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let created = token(&[]);
+    let (id, read_token) = created.trim_end().split_once(' ').unwrap();
+    assert_eq!(token(&["--list"]), format!("{id} active\n"));
+    assert!(request("GET", "/", HOST, "").starts_with("HTTP/1.1 403 "));
+    let login = request("GET", &format!("/?keep=1&t={read_token}&also=2"), HOST, "");
+    assert!(login.starts_with("HTTP/1.1 303 "));
+    assert!(login.contains("\r\nLocation: /?keep=1&also=2\r\n"));
+    assert!(login.contains("; HttpOnly; SameSite=Strict; Path=/; Secure\r\n"));
+    assert!(login.contains("\r\nReferrer-Policy: no-referrer\r\n"));
+    assert!(!login.contains(read_token));
+    let cookie = login
+        .lines()
+        .find_map(|line| line.strip_prefix("Set-Cookie: "))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let cookie_headers = format!("{HOST}Cookie: {cookie}\r\n");
+    assert!(request("GET", "/", &cookie_headers, "").starts_with("HTTP/1.1 200 "));
+    let forged = format!("{HOST}Cookie: semon_session={id}.{}\r\n", "0".repeat(64));
+    assert!(request("GET", "/", &forged, "").starts_with("HTTP/1.1 403 "));
+    let no_origin = format!("{cookie_headers}Content-Type: application/json\r\n");
+    assert!(
+        request("POST", "/api/viewer/home", &no_origin, r#"{"seen":[]}"#)
+            .starts_with("HTTP/1.1 403 ")
+    );
+    let read_headers = format!("{HOST}Authorization: Bearer {read_token}\r\n");
+    for headers in [
+        read_headers.replace("receiver.example:8443", "receiver.example"),
+        read_headers.replace("receiver.example:8443", "receiver.example.evil:8443"),
+        format!("{read_headers}Host: {address}\r\n"),
+        format!("{read_headers}Origin: https://other.example\r\n"),
+        format!("{read_headers}Origin: http://receiver.example:8443\r\n"),
+        format!("{read_headers}Origin: {PUBLIC}\r\nOrigin: {PUBLIC}\r\n"),
+    ] {
+        assert!(request("GET", "/", &headers, "").starts_with("HTTP/1.1 403 "));
+    }
+    for target in [
+        format!("//elsewhere.example/?t={read_token}"),
+        format!("/?t={read_token}&%74=hidden"),
+    ] {
+        assert!(!request("GET", &target, HOST, "").contains("\r\nLocation:"));
+    }
+    let local_read = format!("Host: {address}\r\nAuthorization: Bearer {read_token}\r\n");
+    assert!(request("GET", "/api/viewer/chrome", &local_read, "").starts_with("HTTP/1.1 200 "));
+
+    let dir = fixture.dir();
+    let now = semon_push::simple_pair::now().unwrap();
+    let (code, _) = semon_push::simple_pair::issue(&dir, now).unwrap();
+    let pair_body = json!({"version":1,"code":code.expose(),"machine_id":"machine-6754a9c1e83f27b4","hostname":"synthetic"}).to_string();
+    assert!(request("POST", "/v1/pair", &read_headers, &pair_body).starts_with("HTTP/1.1 403 "));
+    let paired = request("POST", "/v1/pair", HOST, &pair_body);
+    assert!(paired.starts_with("HTTP/1.1 200 "));
+    let paired: serde_json::Value =
+        serde_json::from_str(paired.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let push_token = paired["token"].as_str().unwrap();
+    let push_headers = format!("{HOST}Authorization: Bearer {push_token}\r\n");
+    assert!(request("GET", "/", &push_headers, "").starts_with("HTTP/1.1 403 "));
+    assert!(request("GET", &format!("/?t={push_token}"), HOST, "").starts_with("HTTP/1.1 403 "));
+    assert!(request("POST", "/v1/push/facts", &read_headers, "{}").starts_with("HTTP/1.1 401 "));
+    assert!(request("POST", "/v1/unpair", &read_headers, "").starts_with("HTTP/1.1 401 "));
+
+    fixture.write("token", push_token.as_bytes());
+    fixture.write(
+        &format!("home/{LOG}"),
+        (claude("pushed history") + &assistant("seen")).as_bytes(),
+    );
+    assert_ok(&fixture.push(&url), "push with a Viewer on the same port");
+    let history = request("GET", "/api/tree", &read_headers, "");
+    assert!(history.starts_with("HTTP/1.1 200 "));
+    assert!(history.contains("machine-6754a9c1e83f27b4"));
+    let tree: serde_json::Value =
+        serde_json::from_str(history.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(tree["roots"][0]["id"], "lane");
+    assert!(request("GET", "/", &cookie_headers, "").starts_with("HTTP/1.1 200 "));
+
+    let stalled: Vec<_> = (0..4).map(|_| {
+        let mut stream = connect();
+        write!(stream, "POST /api/viewer/home HTTP/1.1\r\n{cookie_headers}Origin: {PUBLIC}\r\nContent-Type: application/json\r\nContent-Length: 11\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        let mut interim = [0; 25];
+        stream.read_exact(&mut interim).unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        stream
+    }).collect();
+    assert!(request("GET", "/", &read_headers, "").starts_with("HTTP/1.1 503 "));
+    let (push_head, facts) = (format!("POST /v1/push/facts HTTP/1.1\r\n{push_headers}"),
+        json!({"version":2,"hostname":"synthetic","home":null,"proc_starts":{},"codex_locks":{},"repos":{},"repo_ids":{}}).to_string());
+    let mut push = BufReader::new(connect());
+    for _ in 0..2 {
+        write!(
+            push.get_mut(),
+            "{push_head}Content-Length: {}\r\n\r\n{facts}",
+            facts.len()
+        )
+        .unwrap();
+        let mut status = String::new();
+        push.read_line(&mut status).unwrap();
+        assert!(status.starts_with("HTTP/1.1 200 "), "{status}");
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert_ne!(push.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        push.read_exact(&mut vec![0; length.unwrap()]).unwrap();
+    }
+    drop(push);
+    for mut viewer in stalled {
+        viewer.write_all(br#"{"seen":[]}"#).unwrap();
+        viewer.shutdown(Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        viewer.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 "));
+    }
+
+    assert_eq!(token(&["--revoke", id]), "");
+    assert_eq!(token(&["--list"]), format!("{id} revoked\n"));
+    assert!(request("GET", "/", &cookie_headers, "").starts_with("HTTP/1.1 403 "));
+    assert!(request("GET", "/", &read_headers, "").starts_with("HTTP/1.1 403 "));
 }

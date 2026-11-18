@@ -404,7 +404,6 @@ fn only_post_to_the_two_endpoints() {
     assert_eq!(answer.status, 405);
     assert!(answer.head.contains("Allow: POST"));
     for route in [
-        "/",
         "/v1/push",
         "/v1/push/append/",
         "/v1/push/append?x=1",

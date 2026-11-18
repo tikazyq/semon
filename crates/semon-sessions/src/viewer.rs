@@ -455,6 +455,20 @@ fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name, value).expect("static HTTP header")
 }
 
+/// Cookie used by standalone and embedded Viewer transports.
+pub const VIEWER_SESSION_COOKIE: &str = "semon_session";
+
+pub fn viewer_session_cookie(value: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{VIEWER_SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/{secure}")
+}
+
+/// A query part that names the Viewer bootstrap credential, even when encoded.
+pub fn viewer_token_parameter(part: &str) -> bool {
+    let name = part.split_once('=').map_or(part, |(name, _)| name);
+    decoded(name).as_deref() == Some("t")
+}
+
 fn respond(request: Request, reply: ViewerReply, cookie: Option<&str>) {
     let headers = reply.headers();
     let mut response = Response::from_data(reply.body).with_status_code(StatusCode(reply.status));
@@ -466,10 +480,7 @@ fn respond(request: Request, reply: ViewerReply, cookie: Option<&str>) {
         response.add_header(header(name, value));
     }
     if let Some(token) = cookie {
-        response.add_header(header(
-            "Set-Cookie",
-            &format!("semon_session={token}; HttpOnly; SameSite=Strict; Path=/"),
-        ));
+        response.add_header(header("Set-Cookie", &viewer_session_cookie(token, false)));
     }
     let _ = request.respond(response);
 }
@@ -748,10 +759,7 @@ impl Viewer {
         // Credentials are transport-only; reject duplicate or invalid URL tokens.
         let credentials: Vec<_> = query
             .split('&')
-            .filter(|part| {
-                let name = part.split_once('=').map_or(*part, |(name, _)| name);
-                decoded(name).as_deref() == Some("t")
-            })
+            .filter(|part| viewer_token_parameter(part))
             .collect();
         if !credentials.is_empty()
             && (credentials.len() != 1
@@ -786,40 +794,58 @@ impl Viewer {
             .join("&");
         let query = routing_query.as_str();
         let if_none_match = request_header(&request, "If-None-Match").map(str::to_owned);
-        let reply = if path == "/api/viewer/home" && request.method() == &Method::Post {
-            let mut bytes = Vec::new();
-            let body = request
+        let is_home_post = path == "/api/viewer/home" && request.method() == &Method::Post;
+        let mut bytes = Vec::new();
+        if is_home_post
+            && request
                 .as_reader()
-                .take(512 * 1024 + 1)
-                .read_to_end(&mut bytes);
-            let value = serde_json::from_slice::<Value>(&bytes);
-            if body.is_err()
-                || bytes.len() > 512 * 1024
-                || value
-                    .as_ref()
-                    .ok()
-                    .and_then(|value| value["seen"].as_array())
-                    .is_none()
-            {
-                json_reply(
-                    400,
-                    serde_json::json!({"error":"Invalid Home read arguments"}),
-                )
-            } else {
-                let value = value.unwrap();
-                let joined = format!(
-                    "{}{}seen={}",
-                    query,
-                    if query.is_empty() { "" } else { "&" },
-                    percent_encode(&value["seen"].to_string())
-                );
-                self.core.respond("GET", path, &joined, None)
-            }
-        } else {
-            self.core
-                .respond("GET", path, query, if_none_match.as_deref())
-        };
+                .take(VIEWER_HOME_BODY_LIMIT as u64 + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+        {
+            bytes.clear();
+        }
+        let reply = self.core.respond_viewer_read(
+            path,
+            query,
+            if_none_match.as_deref(),
+            is_home_post.then_some(bytes.as_slice()),
+        );
         respond(request, reply, set_cookie.then_some(&self.token));
+    }
+}
+
+pub const VIEWER_HOME_BODY_LIMIT: usize = 512 * 1024;
+
+impl ViewerCore {
+    /// Serve an authorized Viewer read. Home's POST form carries its seen
+    /// results in the body. All other reads use the same GET router.
+    pub fn respond_viewer_read(
+        &self,
+        path: &str,
+        query: &str,
+        if_none_match: Option<&str>,
+        home_body: Option<&[u8]>,
+    ) -> ViewerReply {
+        let Some(body) = home_body else {
+            return self.respond("GET", path, query, if_none_match);
+        };
+        let value = (body.len() <= VIEWER_HOME_BODY_LIMIT)
+            .then(|| serde_json::from_slice::<Value>(body).ok())
+            .flatten();
+        let Some(seen) = value.as_ref().and_then(|value| value["seen"].as_array()) else {
+            return json_reply(
+                400,
+                serde_json::json!({"error":"Invalid Home read arguments"}),
+            );
+        };
+        let joined = format!(
+            "{}{}seen={}",
+            query,
+            if query.is_empty() { "" } else { "&" },
+            percent_encode(&serde_json::to_string(seen).expect("JSON array serializes"))
+        );
+        self.respond("GET", path, &joined, None)
     }
 }
 /// When a background check is next due, after one that started at
@@ -1527,52 +1553,48 @@ impl MachineView {
         }
     }
     fn route(&self, path: &str, _query: &str) -> io::Result<(u16, &'static str, Vec<u8>)> {
-        let html = "text/html; charset=utf-8";
-        let json = "application/json; charset=utf-8";
-        match path {
-            "/" | "/analytics" | "/sessions" | "/machines" => Ok((200, html, PAGE.into())),
-            "/viewer.js" => Ok((
+        if path == "/api/tree" {
+            return Ok((
                 200,
-                "text/javascript; charset=utf-8",
-                crate::shell::VIEWER_JS.into(),
-            )),
-            "/viewer.css" => Ok((
-                200,
-                "text/css; charset=utf-8",
-                crate::shell::VIEWER_CSS.into(),
-            )),
-            "/mark.svg" => Ok((200, "image/svg+xml", include_str!("mark.svg").into())),
-            _ if crate::HARNESS_ICONS
-                .iter()
-                .any(|(icon_path, _)| *icon_path == path) =>
-            {
-                let svg = crate::HARNESS_ICONS
-                    .iter()
-                    .find_map(|(icon_path, svg)| (*icon_path == path).then_some(*svg))
-                    .expect("icon path was matched in HARNESS_ICONS");
-                Ok((200, "image/svg+xml", svg.as_bytes().to_vec()))
-            }
-            "/favicon.svg" => Ok((200, "image/svg+xml", include_str!("favicon.svg").into())),
-            "/shell.js" => Ok((
-                200,
-                "text/javascript; charset=utf-8",
-                crate::shell::JS.into(),
-            )),
-            "/shell.css" => Ok((200, "text/css; charset=utf-8", crate::shell::CSS.into())),
-            "/api/tree" => Ok((200, json, self.tree_json()?.into_bytes())),
-            _ if path.starts_with("/fonts/") => {
-                let name = path["/fonts/".len()..]
-                    .strip_suffix(".woff2")
-                    .ok_or(io::ErrorKind::NotFound)?;
-                FONTS
-                    .iter()
-                    .find(|(font, _)| *font == name)
-                    .map(|(_, bytes)| (200, "font/woff2", bytes.to_vec()))
-                    .ok_or_else(|| io::ErrorKind::NotFound.into())
-            }
-            _ => Err(io::ErrorKind::NotFound.into()),
+                "application/json; charset=utf-8",
+                self.tree_json()?.into_bytes(),
+            ));
         }
+        let reply = static_reply(path).ok_or(io::ErrorKind::NotFound)?;
+        Ok((reply.status, reply.content_type, reply.body))
     }
+}
+
+pub(crate) fn static_reply(path: &str) -> Option<ViewerReply> {
+    let (content_type, body) = match path {
+        "/" | "/analytics" | "/sessions" | "/machines" => ("text/html; charset=utf-8", PAGE.into()),
+        "/viewer.js" => (
+            "text/javascript; charset=utf-8",
+            crate::shell::VIEWER_JS.into(),
+        ),
+        "/viewer.css" => ("text/css; charset=utf-8", crate::shell::VIEWER_CSS.into()),
+        "/mark.svg" => ("image/svg+xml", include_str!("mark.svg").into()),
+        "/favicon.svg" => ("image/svg+xml", include_str!("favicon.svg").into()),
+        "/shell.js" => ("text/javascript; charset=utf-8", crate::shell::JS.into()),
+        "/shell.css" => ("text/css; charset=utf-8", crate::shell::CSS.into()),
+        _ if path.starts_with("/fonts/") => {
+            let name = path.strip_prefix("/fonts/")?.strip_suffix(".woff2")?;
+            let (_, bytes) = FONTS.iter().find(|(font, _)| *font == name)?;
+            ("font/woff2", bytes.to_vec())
+        }
+        _ => {
+            let (_, svg) = crate::HARNESS_ICONS
+                .iter()
+                .find(|(icon, _)| *icon == path)?;
+            ("image/svg+xml", svg.as_bytes().to_vec())
+        }
+    };
+    Some(ViewerReply {
+        status: 200,
+        content_type,
+        body,
+        etag: None,
+    })
 }
 
 impl Drop for MachineView {

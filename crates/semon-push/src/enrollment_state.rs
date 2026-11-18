@@ -39,8 +39,9 @@ impl Registry {
     pub(crate) fn check_admission(&self) -> Result<()> {
         let size = serde_json::to_vec(self).map_err(|_| Error::Invalid)?.len() as u64;
         // Reserve the maximum terminal timestamp/availability deltas per record.
-        let terminal_delta =
-            self.credentials.len() as u64 * 20 + self.enrollments.len() as u64 * (20 + 512);
+        let terminal_delta = self.credentials.len() as u64 * 20
+            + self.enrollments.len() as u64 * (20 + 512)
+            + self.read_tokens.terminal_reserve();
         // Four process-local pending attempts can each commit a receipt. Reserve
         // their maximum encoded outcomes for every authority-producing writer,
         // including pairing in other processes.

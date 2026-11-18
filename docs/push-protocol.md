@@ -4,10 +4,11 @@
 
 `semon receive` is the reference receiver (`semon_push::mirror::Receiver`, see the README's "Receive pushes from your other machines"). It keeps each machine's copy under `DIR/machines/<machine-id>/`, and caps a request body at 6 MiB: one append's 4 MiB of file bytes as base64, plus the JSON around it. Beyond the answers below, it may answer 411 (no `Content-Length`) and 507 (the machine's copy would pass its size cap); a client treats either as a failure.
 
-Registry format 7 stores the origin-generated canonical machine ID
+Registry format 8 stores the origin-generated canonical machine ID
 (`machine-<8 lowercase hex Unix seconds><8 secure random hex digits>`), matching
 directory locator, optional display name, pending code hash, pairing gate, hashed
-push Bearers and pairing/revocation audit. New machine names default to hostname;
+push Bearers and pairing/revocation audit, and a separate set of hashed owner
+Viewer tokens with their own create/revoke audit. New machine names default to hostname;
 existing names survive re-pairing. Unsupported state is refused explicitly; use a
 fresh receiver directory, preserving all old state and received logs.
 
@@ -18,7 +19,7 @@ The running receiver reads this state per request, without IPC.
 
 ### `POST <url>/v1/pair`
 
-No Authorization header is required. The strict JSON request is at most 8 KiB:
+An Authorization header is refused. The strict JSON request is at most 8 KiB:
 
 ```json
 {"version":1,"code":"01234-5678X","machine_id":"machine-12345678abcdef01","hostname":"laptop"}
