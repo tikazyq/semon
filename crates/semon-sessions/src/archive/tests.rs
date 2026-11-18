@@ -931,7 +931,7 @@ fn complete_archive_rebuilds_identical_native_rows_and_sidecar() {
     let page = crate::inputs::Discovery::default()
         .next(&rebuilt, 64, 64)
         .unwrap();
-    assert_eq!(page.inputs, [input.clone()]);
+    assert_eq!(page.inputs.as_slice(), std::slice::from_ref(&input));
     let (native, _) = archive.open_native(&rebuilt, &path).unwrap().unwrap();
     assert_eq!(native.native_id, "child");
     assert_eq!(

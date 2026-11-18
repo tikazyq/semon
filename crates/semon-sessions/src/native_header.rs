@@ -339,7 +339,7 @@ mod tests {
             .unwrap();
         let mut marker: Value = serde_json::from_str(&encoded).unwrap();
         let header = home.header_text();
-        assert_eq!(marker["version"], 6);
+        assert_eq!(marker["version"], 7);
         connection
             .execute(
                 "UPDATE meta SET value=value || ' ' WHERE key=?1",
@@ -377,6 +377,8 @@ mod tests {
         connection
             .execute("DELETE FROM meta WHERE key=?1", [&header_key])
             .unwrap();
+        // Exercise the marker's retained-row contract with no replayable copy.
+        fs::remove_dir_all(crate::archive::standalone_dir(&home.options.cache)).unwrap();
         fs::remove_file(&home.path).unwrap();
         let unsupported = crate::native_timing::cleanup_tests::snapshot(&connection);
         // Normal producers (including Query) now rebuild obsolete indexes;

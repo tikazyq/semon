@@ -857,7 +857,9 @@ fn query_source_reads_reject_replacement_and_deletion() {
         let bytes = fs::read(&path).unwrap();
         // Keep the original inode alive to avoid inode reuse in the fixture.
         fs::rename(&path, path.with_extension("retired")).unwrap();
-        if !delete {
+        if delete {
+            home.remove_standalone_archive();
+        } else {
             fs::write(&path, bytes).unwrap();
             fs::File::options()
                 .write(true)

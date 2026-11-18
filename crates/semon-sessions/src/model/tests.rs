@@ -5711,6 +5711,11 @@ fn archived_codex_rollouts_keep_history_and_input_copy_parity() {
         .join("codex/archived_sessions/rollout-archived-root.jsonl");
     fs::create_dir_all(archived.parent().unwrap()).unwrap();
     fs::rename(&active, &archived).unwrap();
+    assert!(
+        crate::archive::Archive::native_inputs(&home.options)
+            .unwrap()
+            .is_empty()
+    );
     let bytes = fs::read(&archived).unwrap();
     let after = home.build_query();
     assert!(after.sessions.contains_key("archived-root"));

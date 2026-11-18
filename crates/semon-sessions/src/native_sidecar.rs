@@ -603,7 +603,7 @@ mod tests {
             })
             .unwrap();
         let marker: Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(marker["version"], 6);
+        assert_eq!(marker["version"], 7);
         fs::write(&home.meta, metadata().to_string() + " ").unwrap();
         assert!(!crate::source_event_index_retained(&home.options, &proof, &ready).unwrap());
         home.refuse_eviction();
@@ -652,6 +652,8 @@ mod tests {
         home.connection()
             .execute("DELETE FROM meta WHERE key=?1", [home.key()])
             .unwrap();
+        // Exercise the marker's retained-row contract with no replayable copy.
+        fs::remove_dir_all(crate::archive::standalone_dir(&home.options.cache)).unwrap();
         fs::remove_file(&home.path).unwrap();
         let connection = home.connection();
         let unsupported = crate::native_timing::cleanup_tests::snapshot(&connection);

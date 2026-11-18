@@ -433,9 +433,24 @@ impl Archive {
         {
             return Ok(None);
         }
-        match crate::open_input(&input.full_path(options)) {
+        let path = input.full_path(options);
+        match crate::open_input(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             _ => return Ok(None),
+        }
+        // Codex moves active rollouts into archived_sessions. A verified
+        // same-inode move still has a live carrier and must not appear twice.
+        if input.root == InputRoot::Codex
+            && input.path.starts_with("sessions/")
+            && let Some(name) = path.file_name()
+            && let Ok(mut moved) = LogFile::open(&native.home.join("archived_sessions").join(name))
+            && let Ok(stat) = moved
+                .metadata()
+                .and_then(|meta| crate::events::Stat::from_metadata(&meta))
+            && stat.ino != 0
+            && native.ledger.resumes(&stat, &mut moved)
+        {
+            return Ok(None);
         }
         Ok(Some((native, chain, input)))
     }
