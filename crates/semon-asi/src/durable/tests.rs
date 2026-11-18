@@ -158,6 +158,23 @@ fn insert_only_guards_and_failed_writes_keep_revision() {
 }
 
 #[test]
+fn revision_respects_sqlite_integer_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = Writer::open(dir.path()).unwrap();
+    writer
+        .connection
+        .execute("UPDATE durable_state SET revision = ?1", [i64::MAX - 1])
+        .unwrap();
+    let max_revision = i64::MAX.unsigned_abs();
+    assert_eq!(writer.insert_label(&label("last")).unwrap(), max_revision);
+    assert!(writer.insert_label(&label("overflow")).is_err());
+    let (revision, rows) = outbox(dir.path(), max_revision - 1).unwrap();
+    assert_eq!(revision, max_revision);
+    assert_eq!(rows.len(), 1);
+    assert!(outbox(dir.path(), max_revision + 1).is_err());
+}
+
+#[test]
 fn adjudication_rejects_each_kind_of_disagreement() {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = Writer::open(dir.path()).unwrap();

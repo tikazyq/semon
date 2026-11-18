@@ -170,7 +170,7 @@ impl Writer {
     fn write(
         &mut self,
         id: &str,
-        write: impl FnOnce(&Transaction<'_>, u64) -> Result<()>,
+        write: impl FnOnce(&Transaction<'_>, i64) -> Result<()>,
     ) -> Result<u64> {
         if id.is_empty() || id.contains('\0') {
             return Err(Error::invalid("invalid author-assigned durable row ID"));
@@ -181,9 +181,11 @@ impl Writer {
             [],
             |row| row.get(0),
         )?;
+        let committed_revision =
+            u64::try_from(revision).map_err(|_| Error::invalid("negative durable revision"))?;
         write(&tx, revision)?;
         tx.commit()?;
-        Ok(revision)
+        Ok(committed_revision)
     }
 }
 
@@ -281,6 +283,9 @@ fn require_format(connection: &Connection) -> Result<()> {
 /// Publication reads the counter and the categorical outbox from one snapshot.
 /// No body column is selected or passed to the analytics writer.
 pub(crate) fn outbox(store_root: &Path, checkpoint: u64) -> Result<(u64, Vec<Row>)> {
+    let sqlite_checkpoint = i64::try_from(checkpoint).map_err(|_| {
+        Error::invalid("analytics revision checkpoint is outside the SQLite integer range")
+    })?;
     let path = path(store_root);
     if !exists(&path)? && checkpoint == 0 {
         return Ok((0, Vec::new()));
@@ -288,12 +293,12 @@ pub(crate) fn outbox(store_root: &Path, checkpoint: u64) -> Result<(u64, Vec<Row
     let mut connection = open(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let tx = connection.transaction()?;
     require_format(&tx)?;
-    let revision: u64 = tx.query_row(
+    let revision: i64 = tx.query_row(
         "SELECT revision FROM durable_state WHERE singleton = 1",
         [],
         |row| row.get(0),
     )?;
-    if revision < checkpoint {
+    if revision < sqlite_checkpoint {
         return Err(Error::invalid(
             "durable store is older than the analytics revision checkpoint",
         ));
@@ -306,7 +311,7 @@ pub(crate) fn outbox(store_root: &Path, checkpoint: u64) -> Result<(u64, Vec<Row
          FROM adjudication WHERE revision > ?1",
     )?;
     let rows = statement
-        .query_map([checkpoint], |row| {
+        .query_map([sqlite_checkpoint], |row| {
             Ok(Row::from([
                 ("label_id", Cell::Text(row.get(0)?)),
                 ("target_type", Cell::Text(row.get(1)?)),
@@ -321,6 +326,8 @@ pub(crate) fn outbox(store_root: &Path, checkpoint: u64) -> Result<(u64, Vec<Row
             ]))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let revision =
+        u64::try_from(revision).map_err(|_| Error::invalid("negative durable revision"))?;
     Ok((revision, rows))
 }
 
