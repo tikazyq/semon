@@ -49,6 +49,38 @@ pub(crate) struct Sources {
     cache: PathBuf,
 }
 
+/// A verified prefix remained valid, but its physical source moved during I/O.
+#[derive(Debug)]
+pub(crate) struct SourceChanged;
+
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native query source changed during verify/read")
+    }
+}
+impl std::error::Error for SourceChanged {}
+
+pub(crate) fn source_changed(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<SourceChanged>())
+}
+
+fn copy_error(error: &io::Error) -> io::Error {
+    if source_changed(error) {
+        io::Error::new(error.kind(), SourceChanged)
+    } else if let Some(stage) = crate::source_carrier::FailureStage::of(error) {
+        stage.wrap(io::Error::other(error.to_string()))
+    } else if let Some(revision) = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<crate::source_carrier::RevisionChanged>())
+    {
+        revision.0.error()
+    } else {
+        io::Error::new(error.kind(), error.to_string())
+    }
+}
+
 fn unavailable() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -372,7 +404,7 @@ impl Sources {
             checked_chunks: Mutex::default(),
             checked_evidence: Mutex::default(),
             prepared: Mutex::default(),
-            failed: Mutex::new(false),
+            failed: Mutex::new(None),
             revision: Mutex::new(None),
             failure_stage: Mutex::new(None),
         }
@@ -382,6 +414,26 @@ impl Sources {
 #[cfg(test)]
 thread_local! {
     pub(crate) static BEFORE_FOCUSED_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static AFTER_VERIFY: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static AFTER_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_verify_hook() {
+    AFTER_VERIFY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn run_read_hook() {
+    AFTER_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 /// The verification cache belongs to one read, never the shared query cohort.
@@ -397,7 +449,7 @@ pub(crate) struct Records<'a> {
     // Only scalar preparation reuses bytes; ordinary ranges verify the current
     // block on every read. Completion reopens and checks every used source.
     prepared: Mutex<Option<PreparedBlock>>,
-    failed: Mutex<bool>,
+    failed: Mutex<Option<io::Error>>,
     revision: Mutex<Option<crate::source_carrier::RevisionReason>>,
     failure_stage: Mutex<Option<crate::source_carrier::FailureStage>>,
 }
@@ -413,13 +465,34 @@ struct PreparedBlock {
 }
 
 impl Records<'_> {
+    fn remember<T>(&self, result: &io::Result<T>) {
+        if let Err(error) = result
+            && let Ok(mut first) = self.failed.lock()
+        {
+            first.get_or_insert_with(|| copy_error(error));
+        }
+    }
+
+    // Revalidate the consumed prefix before classifying a physical race as
+    // retryable. A rewrite, truncation or replacement remains a hard refusal.
+    fn changed(&self, proof: &Proof, before: &Stat, file: &mut LogFile) -> io::Error {
+        let error = if proof.ledger.resumes(before, file) {
+            io::Error::new(io::ErrorKind::InvalidData, SourceChanged)
+        } else {
+            unavailable()
+        };
+        self.remember::<()>(&Err(copy_error(&error)));
+        error
+    }
     // Preserve the first physical revision failure even when a presentation
     // parser tolerates a missing record. No partial answer may hide this fence.
     fn reject_revision(&self, reason: crate::source_carrier::RevisionReason) -> io::Error {
         if let Ok(mut revision) = self.revision.lock() {
             revision.get_or_insert(reason);
         }
-        reason.error()
+        let error = reason.error();
+        self.remember::<()>(&Err(copy_error(&error)));
+        error
     }
 
     fn recheck(&self, path: &Path, file: &LogFile, before: &Stat) -> io::Result<()> {
@@ -435,6 +508,7 @@ impl Records<'_> {
     }
 
     fn proof_failure(&self, path: &Path, error: io::Error) -> io::Error {
+        self.remember::<()>(&Err(copy_error(&error)));
         if let Some(stage) = crate::source_carrier::FailureStage::of(&error) {
             if let Ok(mut first) = self.failure_stage.lock() {
                 first.get_or_insert(stage);
@@ -451,6 +525,14 @@ impl Records<'_> {
     }
 
     pub(crate) fn query_error(&self, error: impl std::fmt::Display) -> crate::QueryError {
+        if let Some(first) = self
+            .failed
+            .lock()
+            .ok()
+            .and_then(|first| first.as_ref().map(copy_error))
+        {
+            return crate::QueryError::io(&first);
+        }
         if let Some(stage) = self.failure_stage.lock().ok().and_then(|stage| *stage) {
             return crate::QueryError::source_failure(stage);
         }
@@ -503,9 +585,7 @@ impl Records<'_> {
             };
             crate::native_marker::decode(&self.evidence(path, record)?)
         })();
-        if result.is_err() {
-            *self.failed.lock().map_err(|_| unavailable())? = true;
-        }
+        self.remember(&result);
         result
     }
 
@@ -585,7 +665,7 @@ impl Records<'_> {
                 self.recheck(path, &file, &before)?;
             }
             if Stat::from_metadata(&file.metadata()?)? != before {
-                return Err(unavailable());
+                return Err(self.changed(proof, &before, &mut file));
             }
             self.checked_evidence
                 .lock()
@@ -595,9 +675,7 @@ impl Records<'_> {
                 .insert(record.clone());
             Ok(value)
         })();
-        if result.is_err() {
-            *self.failed.lock().map_err(|_| unavailable())? = true;
-        }
+        self.remember(&result);
         result
     }
     /// Read a native launch's allowlisted fields and fail the entire observation
@@ -623,9 +701,7 @@ impl Records<'_> {
             }
             call.read(path, self)
         })();
-        if result.is_err() {
-            *self.failed.lock().map_err(|_| unavailable())? = true;
-        }
+        self.remember(&result);
         result
     }
 
@@ -683,9 +759,7 @@ impl Records<'_> {
             reader.read_until(b'\n', &mut bytes)?;
             Ok(serde_json::from_slice(&bytes).ok())
         })();
-        if result.is_err() {
-            *self.failed.lock().map_err(|_| unavailable())? = true;
-        }
+        self.remember(&result);
         result
     }
 
@@ -694,7 +768,9 @@ impl Records<'_> {
     /// these same sources before any query projection can be published.
     pub(crate) fn verify_all(&self) -> io::Result<()> {
         for (path, proof) in &self.sources.proofs {
-            self.verify(path, proof)?;
+            let result = self.verify(path, proof);
+            self.remember(&result);
+            result?;
         }
         Ok(())
     }
@@ -758,10 +834,17 @@ impl Records<'_> {
                     .insert(0);
             }
             self.recheck(path, &file, &before)?;
-        } else if (!unchanged && !proof.ledger.resumes(&before, &mut file))
-            || Stat::from_metadata(&file.metadata()?)? != before
-        {
-            return Err(unavailable());
+        } else {
+            if !unchanged && !proof.ledger.resumes(&before, &mut file) {
+                return Err(unavailable());
+            }
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::run_cache(&self.sources.cache, "query_source_after_verify");
+            #[cfg(test)]
+            run_verify_hook();
+            if Stat::from_metadata(&file.metadata()?)? != before {
+                return Err(self.changed(proof, &before, &mut file));
+            }
         }
         checked.insert(path.to_owned(), before);
         Ok(())
@@ -780,9 +863,7 @@ impl Records<'_> {
                 offset,
             )
         })();
-        if result.is_err() {
-            *self.failed.lock().map_err(|_| unavailable())? = true;
-        }
+        self.remember(&result);
         result
     }
 
@@ -792,7 +873,7 @@ impl Records<'_> {
         offset: u64,
     ) -> Option<(serde_json::Value, u64)> {
         let Some(proof) = self.sources.proofs.get(&file.path) else {
-            *self.failed.lock().ok()? = true;
+            self.remember::<()>(&Err(unavailable()));
             return None;
         };
         file.prompts.record_from(
@@ -810,11 +891,17 @@ impl Records<'_> {
     /// Recheck touched sources before returning an answer, including native
     /// records served from the pager's short-lived line cache.
     pub(crate) fn finish(&self) -> io::Result<()> {
+        let result = self.finish_inner();
+        self.remember(&result);
+        result
+    }
+
+    fn finish_inner(&self) -> io::Result<()> {
+        if let Some(first) = self.failed.lock().map_err(|_| unavailable())?.as_ref() {
+            return Err(copy_error(first));
+        }
         if let Some(reason) = *self.revision.lock().map_err(|_| unavailable())? {
             return Err(reason.error());
-        }
-        if *self.failed.lock().map_err(|_| unavailable())? {
-            return Err(unavailable());
         }
         for (path, proof) in &self.sources.proofs {
             if let Some(archive) = &proof.archive {
@@ -880,7 +967,7 @@ impl Records<'_> {
                 self.recheck(path, &file, &before)?;
             }
             if Stat::from_metadata(&file.metadata()?)? != before {
-                return Err(unavailable());
+                return Err(self.changed(proof, &before, &mut file));
             }
         }
         for (path, records) in self
@@ -910,7 +997,7 @@ impl Records<'_> {
                 self.recheck(path, &file, &before)?;
             }
             if Stat::from_metadata(&file.metadata()?)? != before {
-                return Err(unavailable());
+                return Err(self.changed(proof, &before, &mut file));
             }
         }
         Ok(())
@@ -1088,11 +1175,12 @@ impl Records<'_> {
         if qualified {
             self.recheck(path, &file, &before)?;
         }
-        if Stat::from_metadata(&file.metadata()?)? != before
-            || (!qualified
-                && before.changed_ns.is_none()
-                && !proof.ledger.resumes(&before, &mut file))
-        {
+        #[cfg(test)]
+        run_read_hook();
+        if Stat::from_metadata(&file.metadata()?)? != before {
+            return Err(self.changed(proof, &before, &mut file));
+        }
+        if !qualified && before.changed_ns.is_none() && !proof.ledger.resumes(&before, &mut file) {
             return Err(unavailable());
         }
         checked.insert(path.to_owned(), before);
@@ -1243,7 +1331,7 @@ impl SessionSourceReader for Records<'_> {
                     .map_err(|_| unavailable())?
                     .get_or_insert(stage);
             }
-            *self.failed.lock().map_err(|_| unavailable())? = true;
+            self.remember(&result);
         }
         result
     }
@@ -1277,9 +1365,7 @@ impl Read for RangeFile<'_, '_> {
         let result =
             self.records
                 .range_native(self.path, self.proof, self.position, max, self.prepared);
-        if result.is_err() {
-            *self.records.failed.lock().map_err(|_| unavailable())? = true;
-        }
+        self.records.remember(&result);
         let part = result?;
         buffer[..part.bytes.len()].copy_from_slice(&part.bytes);
         self.position += part.bytes.len() as u64;
@@ -1296,7 +1382,7 @@ impl Seek for RangeFile<'_, '_> {
         }
         .filter(|position| *position <= self.proof.ledger.offset);
         let Some(position) = position else {
-            *self.records.failed.lock().map_err(|_| unavailable())? = true;
+            self.records.remember::<()>(&Err(unavailable()));
             return Err(unavailable());
         };
         self.position = position;
@@ -1387,6 +1473,95 @@ mod tests {
             );
             after
         }
+    }
+
+    #[test]
+    fn append_during_verify_and_read_preserves_typed_first_failure() {
+        use std::io::Write;
+        for verify in [true, false] {
+            let fixture = Fixture::new(if verify { "verify-race" } else { "read-race" });
+            fs::write(&fixture.path, b"{\"uuid\":\"old\"}\n").unwrap();
+            let (sources, reference, _) = fixture.sources();
+            let records = sources.reader();
+            let path = fixture.path.clone();
+            let hook: Box<dyn FnMut()> = Box::new(move || {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{\"uuid\":\"appended\"}\n")
+                    .unwrap();
+            });
+            if verify {
+                AFTER_VERIFY.with(|slot| *slot.borrow_mut() = Some(hook));
+            } else {
+                AFTER_READ.with(|slot| *slot.borrow_mut() = Some(hook));
+            }
+            let error = if verify {
+                records.verify_all().unwrap_err()
+            } else {
+                records.read_range(&reference, None, 0, 1).unwrap_err()
+            };
+            AFTER_VERIFY.with(|slot| *slot.borrow_mut() = None);
+            AFTER_READ.with(|slot| *slot.borrow_mut() = None);
+            assert!(source_changed(&error), "{error}");
+            // Exercise the actual tolerant prompt parser too: it returns None
+            // on the failed read, while completion must retain the cause.
+            if !verify {
+                let tolerant = sources.reader();
+                let path = fixture.path.clone();
+                AFTER_READ.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        fs::OpenOptions::new()
+                            .append(true)
+                            .open(&path)
+                            .unwrap()
+                            .write_all(b"{}\n")
+                            .unwrap();
+                    }))
+                });
+                let file = crate::model::SlotFile {
+                    path: fixture.path.clone(),
+                    cwd: None,
+                    prompts: Arc::new(crate::attachments::PromptCache::default()),
+                };
+                assert!(tolerant.prompt(&file, 0).is_none());
+                AFTER_READ.with(|slot| *slot.borrow_mut() = None);
+                assert!(source_changed(&tolerant.finish().unwrap_err()));
+            }
+            // Even a later invalid request or a parser ignoring a missing
+            // record must not replace the first retryable cause.
+            assert!(records.read_range(&reference, Some("wrong"), 0, 1).is_err());
+            assert!(source_changed(&records.finish().unwrap_err()));
+            assert_eq!(
+                records.query_error("record omitted").to_json()["error"]["code"],
+                "source_changed"
+            );
+            assert_eq!(crate::QueryError::io(&error).code, "source_changed");
+        }
+    }
+
+    #[test]
+    fn rewrite_during_read_is_not_retryable_and_stays_first() {
+        let fixture = Fixture::new("rewrite-read-race");
+        fs::write(&fixture.path, b"{\"uuid\":\"old\"}\n").unwrap();
+        let (sources, reference, _) = fixture.sources();
+        let records = sources.reader();
+        let path = fixture.path.clone();
+        AFTER_READ.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::write(&path, b"{\"uuid\":\"new\"}\n").unwrap();
+            }))
+        });
+        let error = records.read_range(&reference, None, 0, 1).unwrap_err();
+        AFTER_READ.with(|slot| *slot.borrow_mut() = None);
+        assert!(!source_changed(&error));
+        records.remember::<()>(&Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            SourceChanged,
+        )));
+        assert!(!source_changed(&records.finish().unwrap_err()));
+        assert_eq!(records.query_error("ignored").code, "io");
     }
 
     #[test]

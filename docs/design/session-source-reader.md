@@ -357,6 +357,16 @@ commits. Seal custody uses the same manifest reference mechanism before publishi
 `custody.json`; a crash can conservatively retain unused bytes. Explicit archive
 pruning cannot retire any registered chain or current native source binding.
 
+## Complete local Query races
+
+A complete local Query whose source changes during verification or a record read
+returns the typed `source_changed` reason only after rechecking the captured
+consumed-prefix hashes. A rewritten prefix, failed proof or source-root check
+remains a persistent refusal. The local Query entry point retries that reason
+once, discarding its cohort and in-memory event/text derivations and preparing
+again from native evidence. A second race returns `error.code: source_changed`
+without a partial answer. Hosted selected reads retain their source fences.
+
 ## Current Semon storage contract
 
 The Event Index initializes schema 49 in one transaction with the current
@@ -366,8 +376,10 @@ retention markers, together with the existing scheduling, activity, body and pro
 projections. See [cohort-bound index evidence](retained-native-projections.md#cohort-bound-index-evidence).
 
 Normal writable producer opens (complete and scoped/background) refuse older
-indexes with `unsupported session index: older schema`, without mutation or an
-automatic rebuild. Schema 49 follows the same refusal path used by schema 48;
+indexes with `unsupported session index: older schema`, naming the actual index
+path and instructing the operator to rename the SQLite file and its `-wal` and
+`-shm` sidecars aside, then rerun with native logs available. This refusal performs
+no mutation or automatic rebuild. Schema 49 follows the same refusal path used by schema 48;
 it adds no operator step. Older/future parser and storage contracts, malformed
 metadata, nonempty schema zero and foreign stores also remain unavailable.
 Selected/focused readers retain read-only qualification and never initialize,

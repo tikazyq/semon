@@ -452,6 +452,17 @@ impl SessionSources {
             .collect()
     }
 
+    pub(crate) fn reset_query(&self) {
+        for (_, evidence) in &self.machines {
+            let mut work = lock(&evidence.storage.work);
+            *write_lock(&evidence.query) = None;
+            work.texts = model::Texts::default();
+            // Reopen and prepare from durable native evidence; do not reuse
+            // partially prepared event state from the failed attempt.
+            work.events = None;
+        }
+    }
+
     pub(crate) fn query_at(&self, now: i64) -> io::Result<crate::union::QueryRead> {
         let parts = self
             .machines

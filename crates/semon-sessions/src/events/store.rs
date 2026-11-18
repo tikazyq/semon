@@ -1958,7 +1958,9 @@ pub(crate) fn focused_connection(path: &Path) -> io::Result<Connection> {
     let read = db.unchecked_transaction().map_err(io::Error::other)?;
     match qualify_contract(&read).map_err(io::Error::other)? {
         Init::Ready => {}
-        Init::Unsupported(reason) => return Err(io::Error::other(reason)),
+        Init::Unsupported(reason) => {
+            return Err(io::Error::other(unsupported_message(path, reason)));
+        }
         _ => return Err(io::Error::other("session index is not initialized")),
     }
     read.commit().map_err(io::Error::other)?;
@@ -4140,7 +4142,7 @@ impl SqliteStore {
             db.busy_timeout(BUSY_TIMEOUT).map_err(classify)?;
             let read = db.unchecked_transaction().map_err(classify)?;
             if let Init::Unsupported(reason) = qualify_producer(&read).map_err(classify)? {
-                return Err(Unopened::Unsupported(reason.into()));
+                return Err(Unopened::Unsupported(unsupported_message(path, reason)));
             }
             read.commit().map_err(classify)?;
         }
@@ -4167,7 +4169,9 @@ impl SqliteStore {
                     "its filesystem doesn't support WAL".to_owned(),
                 ));
             }
-            Init::Unsupported(reason) => return Err(Unopened::Unsupported(reason.into())),
+            Init::Unsupported(reason) => {
+                return Err(Unopened::Unsupported(unsupported_message(path, reason)));
+            }
             Init::Fresh => unreachable!("init initializes fresh storage"),
         }
         let store = Self {
@@ -4222,7 +4226,7 @@ impl SqliteStore {
             match qualify_contract(&read).map_err(classify)? {
                 Init::Ready => {}
                 Init::Unsupported(reason) => {
-                    return Err(Unopened::Unsupported(reason.into()));
+                    return Err(Unopened::Unsupported(unsupported_message(path, reason)));
                 }
                 _ => {
                     return Err(Unopened::Unsupported(
@@ -4884,13 +4888,33 @@ fn qualify_load_schema(connection: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn unsupported_message(path: &Path, reason: &str) -> String {
+    if reason == "unsupported session index: older schema" {
+        format!(
+            "{reason} at {}. Rename the SQLite file and its WAL/SHM sidecars ({}-wal and {}-shm) aside, then rerun with native logs available. Preserve the renamed files: history without available native logs cannot be rebuilt.",
+            path.display(),
+            path.display(),
+            path.display()
+        )
+    } else {
+        reason.to_owned()
+    }
+}
+
+fn connection_unsupported(connection: &Connection, reason: &str) -> io::Error {
+    io::Error::other(unsupported_message(
+        Path::new(connection.path().unwrap_or("<unknown session index>")),
+        reason,
+    ))
+}
+
 /// Bounded selected reads qualify the storage contract in their own snapshot.
 /// Archive marker consumers additionally validate the exact selected marker;
 /// unrelated archive history is never traversed by a focused request.
 pub(crate) fn require_current(connection: &Connection) -> io::Result<()> {
     match qualify_contract(connection).map_err(io::Error::other)? {
         Init::Ready => Ok(()),
-        Init::Unsupported(reason) => Err(io::Error::other(reason)),
+        Init::Unsupported(reason) => Err(connection_unsupported(connection, reason)),
         _ => Err(io::Error::other("session index is not initialized")),
     }
 }
@@ -4902,7 +4926,7 @@ pub(crate) fn current_or_fresh(connection: &Connection) -> io::Result<bool> {
     match qualify_contract(connection).map_err(io::Error::other)? {
         Init::Ready => Ok(true),
         Init::Fresh => Ok(false),
-        Init::Unsupported(reason) => Err(io::Error::other(reason)),
+        Init::Unsupported(reason) => Err(connection_unsupported(connection, reason)),
         _ => Err(io::Error::other("session index is not initialized")),
     }
 }
@@ -10708,7 +10732,23 @@ mod tests {
             unchanged();
             let fail = |result: Result<(SqliteStore, Loaded), Unopened>| match result {
                 Err(Unopened::Unsupported(error)) => {
-                    assert!(error.contains(reason), "{name}: {error}")
+                    assert!(error.contains(reason), "{name}: {error}");
+                    if reason == "older schema" {
+                        assert!(error.contains(path.to_str().unwrap()), "{error}");
+                        assert!(
+                            error.contains(sibling(&path, "-wal").to_str().unwrap()),
+                            "{error}"
+                        );
+                        assert!(
+                            error.contains(sibling(&path, "-shm").to_str().unwrap()),
+                            "{error}"
+                        );
+                        assert!(error.contains("Rename the SQLite file"), "{error}");
+                        assert!(
+                            error.contains("rerun with native logs available"),
+                            "{error}"
+                        );
+                    }
                 }
                 _ => panic!("{name} must be explicitly unsupported"),
             };

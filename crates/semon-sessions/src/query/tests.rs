@@ -34,6 +34,98 @@ fn staged_io_json_is_original_io_shape_with_only_additive_stage() {
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn local_query_retries_one_complete_cohort_after_verify_or_read_append() {
+    use std::{cell::Cell, io::Write, rc::Rc};
+    for verify in [true, false] {
+        for failures in [1, 2] {
+            let home = Home::new("query-append-retry");
+            let path = home.lines(
+                "claude/projects/-work-proj/race.jsonl",
+                &[
+                    human("race", ts(1, 0), "original prompt"),
+                    assistant("race", ts(1, 1), vec![text("original answer")]),
+                ],
+            );
+            let mutations = Rc::new(Cell::new(0));
+            let seen = mutations.clone();
+            let hook: Box<dyn FnMut()> = Box::new(move || {
+                if seen.get() < failures {
+                    let n = seen.get() + 1;
+                    seen.set(n);
+                    let record = human("race", ts(2, n), &format!("appended prompt {n}"));
+                    writeln!(
+                        fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                        "{record}"
+                    )
+                    .unwrap();
+                }
+            });
+            if verify {
+                crate::query_source::AFTER_VERIFY.with(|slot| *slot.borrow_mut() = Some(hook));
+            } else {
+                crate::query_source::AFTER_READ.with(|slot| *slot.borrow_mut() = Some(hook));
+            }
+            let mut query = home.query();
+            let result = query.call_at("list_sessions", &json!({}), NOW);
+            crate::query_source::AFTER_VERIFY.with(|slot| *slot.borrow_mut() = None);
+            crate::query_source::AFTER_READ.with(|slot| *slot.borrow_mut() = None);
+            assert_eq!(mutations.get(), failures);
+            if failures == 1 {
+                let answer = result.unwrap();
+                let fresh = home
+                    .query()
+                    .call_at("list_sessions", &json!({}), NOW)
+                    .unwrap();
+                assert_eq!(
+                    answer, fresh,
+                    "the retry must derive the new complete cohort"
+                );
+                assert_eq!(answer["sessions"][0]["last_activity"], at(2, 1));
+            } else {
+                let error = result.unwrap_err().to_json();
+                assert_eq!(error["error"]["code"], "source_changed");
+                assert!(error.get("sessions").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn local_query_does_not_retry_a_rewritten_consumed_prefix() {
+    use std::{cell::Cell, rc::Rc};
+    let home = Home::new("query-rewrite-refusal");
+    let path = home.lines(
+        "claude/projects/-work-proj/race.jsonl",
+        &[
+            human("race", ts(1, 0), "original prompt"),
+            assistant("race", ts(1, 1), vec![text("original answer")]),
+        ],
+    );
+    let original = fs::read_to_string(&path).unwrap();
+    let hits = Rc::new(Cell::new(0));
+    let seen = hits.clone();
+    crate::query_source::AFTER_VERIFY.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            seen.set(seen.get() + 1);
+            fs::write(
+                &path,
+                original.replace("original prompt", "rewritten prompt"),
+            )
+            .unwrap();
+        }))
+    });
+    let result = home.query().call_at("stalls", &json!({}), NOW);
+    crate::query_source::AFTER_VERIFY.with(|slot| *slot.borrow_mut() = None);
+    let error = result.unwrap_err();
+    assert_eq!(error.code, "io");
+    assert_eq!(
+        hits.get(),
+        1,
+        "a prefix rewrite must never restart the query"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn sealed_codex_fixture(padding: usize) -> (Home, PathBuf) {
     let home = Home::new("sealed-pages");

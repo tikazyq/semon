@@ -112,7 +112,7 @@ const LIST_MAX: i64 = 1000;
 pub struct QueryError {
     /// `unknown_tool`, `invalid_arguments`, `unknown_session`,
     /// `unknown_turn`, `outside_window`, `id_conflict`, `capability_unavailable`,
-    /// `stale_projection` or `io`.
+    /// `stale_projection`, `source_changed` or `io`.
     pub code: &'static str,
     pub message: String,
     /// With `outside_window`: where the window starts (epoch ms).
@@ -164,7 +164,7 @@ impl QueryError {
         self.reason = self.reason.or(match self.code {
             "io" | "unavailable" if exhausted => Some("limit_exceeded"),
             "unavailable" => Some("interrupted"),
-            "io" | "stale_projection" => Some("source_unavailable"),
+            "io" | "stale_projection" | "source_changed" => Some("source_unavailable"),
             "unknown_session" => Some("no_activity"),
             "capability_unavailable" => Some("unsupported_storage"),
             _ => None,
@@ -184,6 +184,9 @@ impl QueryError {
     }
 
     pub(crate) fn io(error: &io::Error) -> Self {
+        if crate::query_source::source_changed(error) {
+            return Self::new("source_changed", error.to_string());
+        }
         if let Some(stage) = crate::source_carrier::FailureStage::of(error) {
             return Self::source_failure(stage);
         }
@@ -952,7 +955,26 @@ impl Query {
         let empty = json!({});
         let args = if args.is_null() { &empty } else { args };
         validate_query_call(tool, args)?;
-        self.execute_at(tool, args, now)
+        let result = self.execute_at(tool, args, now);
+        if !self.embedded
+            && result
+                .as_ref()
+                .is_err_and(|error| error.code == "source_changed")
+        {
+            // Discard the failed cohort and every request-derived cache before
+            // preparing the entire local call again. There is no third attempt.
+            self.native = None;
+            self.start = None;
+            self.sources.reset_query();
+            let retried = self.execute_at(tool, args, now);
+            if retried.is_err() {
+                self.native = None;
+                self.start = None;
+                self.sources.reset_query();
+            }
+            return retried;
+        }
+        result
     }
 
     fn execute_at(&mut self, tool: &str, args: &Value, now: i64) -> Result<Value, QueryError> {
