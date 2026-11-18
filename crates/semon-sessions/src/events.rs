@@ -1,10 +1,9 @@
 //! The per-file event index behind the session model.
 //!
 //! Every event is metadata and byte offsets only: its kind, line offset,
-//! block, time and the ids that join it to other files. It never holds
-//! message text, briefs, tool input or output, or answers (risk:secret).
-//! The model reads text back from the source line by offset and keeps it in
-//! memory only.
+//! block, time and the ids that join it to other files. The model reads text
+//! back from the source line by offset. The separate ASI body projection in
+//! the same SQLite database owns private searchable text.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -339,6 +338,8 @@ impl DirtyRows {
 pub(crate) struct FileIndex {
     #[serde(skip)]
     pub(crate) dirty_rows: Option<DirtyRows>,
+    #[serde(skip)]
+    pub(crate) body_batch: store::body::Batch,
     /// Only this parse batch; durable facts and identities stay in the Event Index.
     #[serde(skip)]
     pub(crate) native_usage_observations: Option<Vec<store::native_usage::Observation>>,
@@ -2926,8 +2927,16 @@ impl EventCache {
                 "cold index batch generation changed",
             ));
         }
-        for (path, _, _) in files {
+        for (path, _, parsed) in files {
+            drop(parsed);
             self.unpersisted.remove(&path);
+            if let Some(index) = self
+                .files
+                .get_mut(&path)
+                .and_then(|file| file.index.as_mut())
+            {
+                Arc::make_mut(index).body_batch = Default::default();
+            }
         }
         Ok(())
     }
@@ -3120,6 +3129,7 @@ pub(crate) fn scan_archive(
             ));
         }
         if cache.store.is_some() && !cache.unpersisted.contains(&key) {
+            index.body_batch = Default::default();
             store::native_usage::checkpoint(&mut index);
             if let Some(store) = cache.store.as_ref()
                 && let Some((stored, metadata)) = store
@@ -3622,7 +3632,9 @@ pub(crate) fn scan_file(
             super::events::store::checkpoint_source_scan(stem, &key, &ledger, &stat)?;
         }
         if cache.store.is_some() && !cache.unpersisted.contains(&key) {
-            store::native_usage::checkpoint(Arc::make_mut(&mut index));
+            let index = Arc::make_mut(&mut index);
+            index.body_batch = Default::default();
+            store::native_usage::checkpoint(index);
             if let Some(store) = cache.store.as_ref()
                 && let Some((stored, metadata)) = store
                     .load_tree(&key, &ledger.stat)
@@ -3654,6 +3666,7 @@ fn parse(
     budget: Option<u64>,
     stored: Option<(&dyn IndexStore, &str, &Ledger)>,
 ) -> io::Result<(u64, [u8; 32], bool)> {
+    index.body_batch = store::body::Batch::new(harness);
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(from))?;
     let mut offset = from;
@@ -3693,6 +3706,7 @@ fn parse(
             SOURCE_HASHED_BYTES.with(|bytes| bytes.set(bytes.get() + length as u64));
         }
         let record = serde_json::from_slice::<Value>(&line);
+        index.body_batch.observe(record.as_ref().ok());
         // Only a touched message needs its old report for the Tree delta.
         if harness == "claude"
             && let Some(summary) = &mut index.tree_summary

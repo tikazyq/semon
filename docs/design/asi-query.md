@@ -2,7 +2,8 @@
 
 Status: accepted architecture/spec for #545 (revised 2026-11-09 for federation
 D1–D8 and DuckDB analytics). #566 delivers local SQL and schema through CLI and
-MCP; search, view, Viewer and Hub remain follow-up work. Store: [ASI store](asi-store.md)
+MCP. #567 adds origin-local search and view through those same surfaces.
+Viewer and remote body access remain follow-up work. Store: [ASI store](asi-store.md)
 (#544). Direction:
 [ASI direction](asi-direction.md#architecture). Remote policy/channel contract:
 [ASI federation](asi-federation.md).
@@ -14,9 +15,8 @@ Four tools over local and admitted federated data:
 - `search`: local FTS5 over index bodies.
 - `view`: a focused local or authorized remote typed body read.
 
-They are exposed through MCP and the CLI, through the authenticated Viewer
-server for its own store, and through Hub per tenant (`sql` and `schema`
-only). Receiver access requires per-user, machine and namespace authorization and
+The local tools are exposed through MCP and the CLI. The Viewer and Hub
+contracts below describe separate surfaces. Hub admits only `sql` and `schema`. Receiver access requires per-user, machine and namespace authorization and
 audit; these are requirements, not verified shipped safeguards. Remote reads use
 outbound-only read verbs, with no control, runtime, SSH or Encrypted Relay.
 There is no network SQL endpoint. These tools replace the paused
@@ -78,7 +78,8 @@ It takes one of four kernel-released per-store query locks, launches
 `semon asi query-worker`, sends one JSON object on stdin, and receives one JSON
 result or error object on stdout. The internal request is
 `{"root":"absolute store directory","request":{"query":"SELECT ...","params":[],"limit":1000,"timeout_ms":2000,"max_bytes":1048576}}`.
-Unknown fields are refused. `max_bytes` is an internal response budget, bounded
+The same worker accepts an internal host-owned extension request for body
+queries. Unknown fields are refused. `max_bytes` is an internal response budget, bounded
 by 4 MiB; it does not add an input to the public tools. The runner clears the
 child environment, owns its scratch directory and OS limits, and kills/reaps
 it at the whole-request deadline. Each worker has its own process group, which
@@ -159,12 +160,17 @@ FTS5 over index bodies, in each namespace's ingest index:
 - `body(body_uid, session_uid, turn_uid, step_uid, part, ord, ts, text)`, where
   `part` is one of `user`, `assistant`, `command`, `tool_output` and `error`,
   and `step_uid` is `null` for parts no step owns. `body_uid` is
-  `{turn_uid or step_uid}/b/{part}/{ord}`.
+  `{turn_uid or step_uid}/b/{part}/{ord}`, with `ord` encoded as the
+  physical record ordinal and the block ordinal within that record.
 - `body_fts`: external-content FTS5 using `unicode61 remove_diacritics 2`.
 
 Bodies are appended with the ingest tail in the same transaction, so
 indexing work grows with new text and not with session length. A source
-rewrite deletes and reinserts that source's bodies.
+rewrite or verified relocation deletes and reinserts the affected bodies in
+the same transaction. Schema 48 refuses older indexes without mutation.
+Stored UIDs are relative to the namespace. Queries qualify them using the
+origin’s `analytics-namespace`, created only by explicit materialization.
+Before materialization, body queries return `not_materialized`.
 
 Search covers origin-local authorized index bodies. The receiver's search surface
 returns `capability_unavailable` before body I/O until federated coverage and audit
@@ -173,21 +179,28 @@ an incomplete cached/replica corpus as complete search. Hub has no search.
 
 - **Input:** `query` (FTS5 syntax; a malformed query is `invalid_query`), and
   optionally `repo`, `harness`, `part`, `since`, `until` and `limit` (default
-  20, maximum 200).
+  20, maximum 200). `repo` takes an ASI repository key, `since` is inclusive,
+  and `until` is exclusive. Both time filters accept RFC 3339 timestamps.
 - **Output:** hits ranked by bm25 within each namespace and merged across
   namespaces by reciprocal rank fusion, because bm25 scores from different
   indexes aren't comparable. Each hit has
   `body_uid`, `session_uid`, `turn_uid`, `step_uid`, `part`, `ts`, and a snippet
-  of up to 300 characters as `{"untrusted_text": "…"}`. The response is capped
+  of up to 300 characters as `{"untrusted_text": "…"}`. The `hits` array
+  is ordered by `1 / (60 + rank)`, with UID as the tie-break across origins.
+  The response is capped
   at 1 MiB, and the deadline and cancellation are the same as for `sql`.
 - On Hub: `capability_unavailable`, before I/O.
 
 ## `view`
 
-Local view reads a focused body by `body_uid`, `step_uid` or `turn_uid`, or
-reads body columns of an authorized durable row (`label/{id}`,
-`adjudication/{id}`, `lane/{id}` or `intervention/{id}`). Bodies and arbitrary
-free text are never analytics columns. Typed names and paths in operator receiver
+Local view reads a focused body by namespace-qualified `body_uid`, `step_uid`
+or `turn_uid`. The `bodies` array contains the same IDs and metadata as search
+with a `text` field framed as `{"untrusted_text": "…"}`. `part` optionally
+filters the selected anchor. The response is capped at 256 KiB.
+`label/{id}`, `adjudication/{id}`, `lane/{id}` and `intervention/{id}`
+currently return `not_found`. The receiver returns `capability_unavailable`
+before body I/O until authorized remote reads ship. Bodies and arbitrary free
+text are never analytics columns. Typed names and paths in operator receiver
 analytics are plain. **PM interpretation of D7, open to user correction:** this
 plain-field choice applies origin→operator receiver; the settled Hub export rule
 still tokenizes paths, and Hub never receives bodies.
@@ -239,7 +252,8 @@ records; cancellation/source changes during a read publish no invalid partial pa
 | `schema_mismatch` | The store's and the engine's `asi_schema_version` differ |
 | `store_unavailable` | Analytics missing or unavailable; frozen retained facts and coverage remain visible where admitted |
 | `invalid_query` | Malformed FTS5 query |
-| `capability_unavailable` | Remote search before federated coverage/audit, or search/view on Hub |
+| `not_materialized` | The local origin has no analytics namespace yet |
+| `capability_unavailable` | Search or view on the receiver or Hub |
 | `body_unavailable` | Remote view cannot supply evidence; closed reason distinguishes retryable `origin_offline` from permanent `source_missing` |
 | `stale_generation` | Requested source, activity, transcript or export-view generation no longer matches |
 | `not_found` | Unknown UID in `view` |
@@ -265,14 +279,14 @@ records; cancellation/source changes during a read publish no invalid partial pa
 
 - **MCP** advertises these beside the existing focused tools. `find`, with
   its retained schema, tests and pause notes, is removed.
-- **CLI:** the current local commands are `semon query sql|schema`; `search`
-  and `view` arrive with their follow-up surfaces. Output is compact JSON by
+- **CLI:** the current local commands are `semon query sql|schema|search|view`
+  in builds with `asi-query`. Output is compact JSON by
   default; `--json` is accepted but redundant. `sql --format tsv` writes a
   tab-delimited header and rows, with tab, newline and carriage-return
   characters in column names and values replaced by spaces. Query failures write
   the same error envelope as JSON on stdout and exit 1; successful commands exit
   0.
-- **Viewer:** `POST /api/asi/sql`, `POST /api/asi/search`,
+- **Planned Viewer routes:** `POST /api/asi/sql`, `POST /api/asi/search`,
   `GET /api/asi/schema` and `POST /api/asi/view`, behind authentication,
   Origin/Host/CSRF checks and per-user/machine/namespace grants. Bodies, search
   strings, paths and credentials never enter URLs or access logs. Body replies use
@@ -313,6 +327,6 @@ records; cancellation/source changes during a read publish no invalid partial pa
 - Results expose admitted heads and freshness/version coverage. Multi-source
   policy intersections never disclose restricted contributions or label a
   fragment complete; SQL never fetches bodies.
-- Current local MCP: `tools/list` has `sql` and `schema`, and no `find`. `search`
-  and `view` arrive with their respective follow-up surfaces.
+- Current local MCP: `tools/list` has `sql`, `schema`, `search` and `view`.
+  `find` is retired.
 - Performance budgets from [ASI store](asi-store.md#performance-from-day-1).

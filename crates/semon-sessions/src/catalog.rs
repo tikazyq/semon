@@ -8345,6 +8345,19 @@ mod tests {
             .unwrap(),
             file_id
         );
+        assert_eq!(db.query_row(
+            "SELECT count(*) FROM body_fts JOIN body b ON b.id=body_fts.rowid JOIN files USING(file_id) WHERE body_fts MATCH 'first' AND path=?1",
+            [new.to_string_lossy()], |row| row.get::<_, i64>(0),
+        ).unwrap(), 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM body_fts WHERE body_fts MATCH 'first'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
         assert_eq!(
             db.query_row(
                 "SELECT count(*) FROM meta WHERE key LIKE 'native_catalog_relocation:%'",

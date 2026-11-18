@@ -1,5 +1,8 @@
 #![cfg(feature = "asi-query")]
 
+#[path = "../../../tests/support/native_home_cli.rs"]
+mod fixture;
+
 use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
@@ -167,6 +170,8 @@ fn mcp_advertises_asi_tools_and_serves_schema_resource() {
         .collect();
     assert!(names.contains(&"sql"));
     assert!(names.contains(&"schema"));
+    assert!(names.contains(&"search"));
+    assert!(names.contains(&"view"));
     assert!(!names.contains(&"find"));
     let sql = tools.iter().find(|tool| tool["name"] == "sql").unwrap();
     assert_eq!(sql["inputSchema"]["required"], json!(["query"]));
@@ -206,4 +211,114 @@ fn mcp_advertises_asi_tools_and_serves_schema_resource() {
     let (error, failed) = content(&reply);
     assert!(failed);
     assert_eq!(error["error"]["code"], "not_allowed");
+}
+
+#[test]
+fn origin_body_queries_through_cli_and_mcp() {
+    let fixture = fixture::Fixture::new();
+    let cache = fixture.root.join("state/index.json");
+    let materialize = || {
+        fixture
+            .command(env!("CARGO_BIN_EXE_semon"))
+            .args(["analytics", "materialize", "--all", "--proc-root"])
+            .arg(fixture.root.join("empty-proc"))
+            .args(cli_args(cache.clone()))
+            .output()
+            .unwrap()
+    };
+    let run = |args: &[&str]| {
+        let output = cli(args, cache.clone());
+        let value = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|_| {
+            panic!("{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        });
+        (output.status.success(), value)
+    };
+    let (ok, error) = run(&["query", "search", "synthetic"]);
+    assert!(!ok);
+    assert_eq!(error["error"]["code"], "not_materialized");
+    assert!(!cache.parent().unwrap().exists());
+    let (ok, error) = run(&["query", "search", "synthetic", "--machine", "/missing"]);
+    assert!(!ok);
+    assert_eq!(error["error"]["code"], "capability_unavailable");
+    assert!(!cache.parent().unwrap().exists());
+
+    let published = materialize();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let (ok, value) = run(&[
+        "query",
+        "search",
+        "\"SEMON_SYNTHETIC_CLAUDE_235\"",
+        "--harness",
+        "claude",
+        "--part",
+        "user",
+        "--since",
+        "2026-10-03T00:00:00Z",
+        "--until",
+        "2026-10-04T00:00:00Z",
+    ]);
+    assert!(ok, "{value}");
+    let hit = &value["hits"][0];
+    assert!(
+        hit["snippet"]["untrusted_text"]
+            .as_str()
+            .unwrap()
+            .contains("SEMON_SYNTHETIC_CLAUDE_235")
+    );
+    let uid = hit["body_uid"].as_str().unwrap();
+    assert!(uid.starts_with("origin-"));
+    let (ok, body) = run(&["query", "view", uid]);
+    assert!(ok, "{body}");
+    assert_eq!(
+        body["bodies"][0]["text"]["untrusted_text"],
+        "SEMON_SYNTHETIC_CLAUDE_235"
+    );
+    let turn = hit["turn_uid"].as_str().unwrap();
+    let (ok, body) = run(&["query", "view", turn, "--part", "user"]);
+    assert!(ok, "{body}");
+    assert_eq!(body["bodies"][0]["body_uid"], uid);
+
+    let (ok, value) = run(&[
+        "query",
+        "search",
+        "SYNTHETIC_ACK",
+        "--harness",
+        "codex",
+        "--part",
+        "assistant",
+    ]);
+    assert!(ok, "{value}");
+    let step = value["hits"][0]["step_uid"].as_str().unwrap();
+    let (ok, body) = run(&["query", "view", step]);
+    assert!(ok, "{body}");
+    assert_eq!(body["bodies"][0]["text"]["untrusted_text"], "SYNTHETIC_ACK");
+
+    let (ok, error) = run(&["query", "search", "\"unterminated"]);
+    assert!(!ok);
+    assert_eq!(error["error"]["code"], "invalid_query");
+    for uid in [
+        "label/sample",
+        "adjudication/sample",
+        "lane/sample",
+        "intervention/sample",
+        "other/claude/session/t/turn",
+    ] {
+        let (ok, error) = run(&["query", "view", uid]);
+        assert!(!ok);
+        assert_eq!(error["error"]["code"], "not_found");
+    }
+
+    let mut server = Server::start(cache);
+    let reply = server.request(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"SYNTHETIC_ACK","harness":"codex","part":"assistant"}}}));
+    let (hits, failed) = content(&reply);
+    assert!(!failed, "{hits}");
+    assert_eq!(hits["hits"][0]["step_uid"], step);
+    let reply = server.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"view","arguments":{"uid":step}}}));
+    let (body, failed) = content(&reply);
+    assert!(!failed, "{body}");
+    assert_eq!(body["bodies"][0]["text"]["untrusted_text"], "SYNTHETIC_ACK");
 }

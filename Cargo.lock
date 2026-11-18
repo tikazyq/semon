@@ -1917,6 +1917,7 @@ dependencies = [
  "semon-asi",
  "semon-push",
  "semon-sessions",
+ "serde",
  "serde_json",
  "tempfile",
 ]

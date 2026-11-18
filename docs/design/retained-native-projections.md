@@ -100,6 +100,12 @@ retained metadata. They never inherit writer liveness or archive read authority.
 Parser 29 qualifies those lifecycle facts; current-source tree repair restores
 them from verified source slices without importing retired Semon storage.
 
+The schema 48 Event Index includes private ASI body rows and FTS5 postings.
+The body projection writes with the consumed source ledger and follows its
+rewrite and relocation transactions. Native metadata and the Viewer’s paged
+transcript still use their existing source-backed read contracts. ASI bodies
+are available only through the origin-local query surface.
+
 Semon reads only its current schema and parser contract. Writable producers refuse
 older, future, foreign and ambiguous stores without mutation: a recognized schema
 number is not source-availability proof for deleting retained generations,

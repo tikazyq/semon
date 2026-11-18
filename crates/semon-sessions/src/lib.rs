@@ -89,6 +89,7 @@ pub use overview_repair::{
     repair_session_overview_with_control, request_session_projection_upgrade,
     session_overview_observe, session_query_sources,
 };
+pub mod body_query;
 mod catalog;
 mod catalog_changes;
 mod catalog_observer;

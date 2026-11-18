@@ -19,6 +19,7 @@
 //! let Row { kept } = row;
 //! ```
 
+pub(super) mod body;
 pub(crate) mod chunk_proofs;
 mod launch_calls;
 pub(crate) mod native_usage;
@@ -251,7 +252,8 @@ fn emit_catalog_publish_attempt(
 // activity summaries for bounded family publication.
 // v47: Catalog parent_source names only the observed evidence owning a link;
 // agreement with native lineage leaves it absent, including staged endpoints.
-pub(crate) const SCHEMA_VERSION: i64 = 47;
+// v48: origin-local bodies, ingest state and external-content FTS5.
+pub(crate) const SCHEMA_VERSION: i64 = 48;
 
 /// How long a write waits for another process's transaction. Tests wait
 /// less, so the busy paths they drive stay quick.
@@ -4323,6 +4325,8 @@ impl SqliteStore {
             // By path, never decoding the row: an undecodable one goes too.
             for table in [
                 "events",
+                "body",
+                "body_state",
                 "signals",
                 "usage_identity",
                 "usage",
@@ -4671,6 +4675,9 @@ fn qualify_contract(connection: &Connection) -> rusqlite::Result<Init> {
     }
     for sql in [
         "SELECT codex_pricing_fingerprint,ctime_ns,copilot FROM files LIMIT 0",
+        "SELECT body_uid,session_uid,turn_uid,step_uid,part,ord,ts,text FROM body LIMIT 0",
+        "SELECT turn,step,next_ord,response_from FROM body_state LIMIT 0",
+        "SELECT rowid FROM body_fts LIMIT 0",
         "SELECT pricing_fingerprint,lifecycle,parent_key FROM session_catalog LIMIT 0",
         "SELECT usage_ready FROM native_usage_sources LIMIT 0",
         "SELECT tree_root FROM native_tree_repairs LIMIT 0",
@@ -4798,7 +4805,7 @@ fn qualify(connection: &Connection) -> rusqlite::Result<Init> {
 }
 
 /// One authored DDL set for cold initialization.
-fn storage_ddl() -> [&'static str; 11] {
+fn storage_ddl() -> [&'static str; 12] {
     [
         SCHEMA,
         native_usage::SCHEMA,
@@ -4811,6 +4818,7 @@ fn storage_ddl() -> [&'static str; 11] {
         crate::catalog_search::SCHEMA,
         crate::catalog_changes::SCHEMA,
         reprice::SCHEMA,
+        body::SCHEMA,
     ]
 }
 
@@ -5797,6 +5805,7 @@ fn read_file(
 
     let index = FileIndex {
         dirty_rows: None,
+        body_batch: Default::default(),
         native_usage_observations: native_usage::normalized(readers.connection, &path, &ledger)?
             .then(Vec::new),
         source_chunks: chunk_proofs::read(readers.connection, &path, &ledger)?,
@@ -6005,6 +6014,8 @@ fn read_run(row: &Row<'_>) -> rusqlite::Result<ReportedRunSnapshot> {
 fn clear(transaction: &Transaction<'_>, file_id: i64) -> rusqlite::Result<()> {
     for table in [
         "events",
+        "body",
+        "body_state",
         "signals",
         "usage_identity",
         "usage",
@@ -6213,6 +6224,7 @@ fn write_file(
 ) -> rusqlite::Result<()> {
     let FileIndex {
         dirty_rows: _,
+        body_batch: _,
         native_usage_observations: _,
         tree_summary,
         source_chunks,
@@ -6337,6 +6349,7 @@ fn write_file(
         measurements.record("file_upsert", started, 1);
         file_id
     };
+    body::write(transaction, file_id, path, index)?;
 
     let started = measurements.start();
     write_tree_summary(
@@ -10403,6 +10416,7 @@ mod tests {
                 "nonempty schema zero",
             ),
             ("newer", "PRAGMA user_version=2147483647", "newer schema"),
+            ("schema-47", "PRAGMA user_version=47", "older schema"),
             (
                 "foreign",
                 "DROP TABLE events; DROP TABLE files",
@@ -10869,6 +10883,192 @@ mod tests {
             );
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn body_search_fuses_origins_and_rewrites_fts_in_place() {
+        use crate::body_query::{BodyQuery, BodyScope, Search, View, execute};
+        let root = scratch("body-search");
+        let first = root.join("first/index.sqlite3");
+        let second = root.join("second/index.sqlite3");
+        let source = "native-session.jsonl";
+        let search = |query: &str| {
+            BodyQuery::Search(Search {
+                query: query.to_owned(),
+                repo: None,
+                harness: None,
+                part: None,
+                since: None,
+                until: None,
+                limit: None,
+            })
+        };
+        let query = search("cafe");
+        for scope in [BodyScope::Receiver, BodyScope::Hub] {
+            for query in [
+                &query,
+                &BodyQuery::View(View {
+                    uid: "anything".to_owned(),
+                    part: None,
+                }),
+            ] {
+                assert_eq!(
+                    execute(scope, std::slice::from_ref(&first), query)
+                        .unwrap_err()
+                        .code,
+                    "capability_unavailable"
+                );
+            }
+        }
+        assert_eq!(
+            execute(BodyScope::Origin, std::slice::from_ref(&first), &query)
+                .unwrap_err()
+                .code,
+            "not_materialized"
+        );
+        assert!(!first.exists());
+        let batch = |texts: &[&str]| {
+            let mut batch = body::Batch::new("claude");
+            for text in texts {
+                batch.observe(Some(
+                    &serde_json::json!({"type":"user","message":{"content":text}}),
+                ));
+            }
+            FileIndex {
+                body_batch: batch,
+                ..FileIndex::default()
+            }
+        };
+        let setup = |index: &Path, namespace: char, texts: &[&str]| {
+            let (mut store, _) = opened(index);
+            assert_eq!(
+                store
+                    .write_one(source, None, None, &ledger(1), &batch(texts))
+                    .unwrap(),
+                Outcome::Written
+            );
+            let state = index.parent().unwrap();
+            assert!(!state.join("analytics-namespace").exists());
+            let namespace = format!("origin-{}", namespace.to_string().repeat(64));
+            fs::write(state.join("analytics-namespace"), format!("{namespace}\n")).unwrap();
+            (store, namespace)
+        };
+        let (mut store, a) = setup(&first, 'a', &["café", "café café", "café elsewhere"]);
+        let (other_store, b) = setup(&second, 'b', &["café elsewhere"]);
+        store.connection.execute_batch(
+            r#"INSERT INTO session_catalog_sources(session_key,harness,native_id,source_path,ledger_epoch)
+             SELECT 'catalog','claude','native-session',path,epoch FROM files;
+             INSERT INTO silver_session_state VALUES('catalog','digest','{"kind":"remote","value":"example.org/team/repo"}');"#
+        ).unwrap();
+        let mut filtered = search("cafe");
+        if let BodyQuery::Search(request) = &mut filtered {
+            request.repo = Some("example.org/team/repo".into());
+        }
+        let indexes = [second, first.clone()];
+        let result = execute(BodyScope::Origin, &indexes, &filtered).unwrap();
+        assert_eq!(result["hits"].as_array().unwrap().len(), 3);
+        let fused = execute(BodyScope::Origin, &indexes, &query).unwrap();
+        let hits = fused["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 4);
+        let ns = |at: usize| {
+            hits[at]["body_uid"]
+                .as_str()
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap()
+        };
+        assert_eq!(
+            [ns(0), ns(1), ns(2), ns(3)],
+            [a.as_str(), b.as_str(), a.as_str(), a.as_str()]
+        );
+        let only_first = std::slice::from_ref(&first);
+        let old_uid = hits
+            .iter()
+            .find_map(|hit| {
+                hit["body_uid"]
+                    .as_str()
+                    .filter(|uid| uid.starts_with(&a) && uid.ends_with("/2-0"))
+            })
+            .unwrap();
+        let old_view = BodyQuery::View(View {
+            uid: old_uid.to_owned(),
+            part: None,
+        });
+        assert_eq!(
+            store
+                .write_one(
+                    source,
+                    Some(&ledger(1)),
+                    Some(&batch(&[])),
+                    &ledger(2),
+                    &batch(&["tailterm"])
+                )
+                .unwrap(),
+            Outcome::Written
+        );
+        assert_eq!(
+            execute(BodyScope::Origin, only_first, &query).unwrap()["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            execute(BodyScope::Origin, only_first, &search("tailterm")).unwrap()["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .write_one(
+                    source,
+                    Some(&ledger(2)),
+                    None,
+                    &ledger(3),
+                    &batch(&["replacement"])
+                )
+                .unwrap(),
+            Outcome::Written
+        );
+        for stale in ["cafe", "tailterm"] {
+            assert_eq!(
+                execute(BodyScope::Origin, only_first, &search(stale)).unwrap()["hits"],
+                serde_json::json!([])
+            );
+        }
+        assert_eq!(
+            execute(BodyScope::Origin, only_first, &old_view)
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            execute(BodyScope::Origin, only_first, &search("replacement")).unwrap()["hits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+        let db = Connection::open(&first).unwrap();
+        db.pragma_update(None, "user_version", 47).unwrap();
+        assert_eq!(
+            execute(BodyScope::Origin, only_first, &query)
+                .unwrap_err()
+                .code,
+            "schema_mismatch"
+        );
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            47
+        );
+        drop(db);
+        drop(other_store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

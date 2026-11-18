@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 mod ast;
@@ -113,7 +113,7 @@ pub struct ErrorDetail {
 }
 
 impl Failure {
-    fn new(code: &str, message: &str, detail: impl Into<String>) -> Self {
+    pub fn new(code: &str, message: &str, detail: impl Into<String>) -> Self {
         Self {
             error: ErrorDetail {
                 code: code.into(),
@@ -138,26 +138,70 @@ impl Failure {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkerRequest {
+struct WorkerRequest<T> {
     root: PathBuf,
-    request: Request,
+    request: T,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtensionRequest<T> {
+    extension: T,
 }
 
 /// Spawns the supplied Semon binary, with no shell. The deadline starts before
 /// admission/spawn and includes setup, input, parsing, binding, execution and fetch.
 /// Four advisory locks enforce admission across processes, not just this caller.
 pub fn run(executable: &Path, root: &Path, request: &Request) -> Result<QueryResult, Failure> {
-    let started = Instant::now();
     request.validate()?;
+    run_bounded(
+        executable,
+        root,
+        request,
+        request.timeout_ms,
+        request.max_bytes,
+    )
+}
+
+/// Run a host-owned query using the SQL worker's locks, deadline and OS limits.
+pub fn run_extension<T: Serialize>(
+    executable: &Path,
+    root: &Path,
+    request: T,
+) -> Result<Value, Failure> {
+    run_bounded(
+        executable,
+        root,
+        &ExtensionRequest { extension: request },
+        default_timeout(),
+        default_bytes(),
+    )
+}
+
+fn run_bounded<T: Serialize, R: DeserializeOwned>(
+    executable: &Path,
+    root: &Path,
+    request: &T,
+    timeout_ms: u64,
+    max_bytes: usize,
+) -> Result<R, Failure> {
+    let started = Instant::now();
     #[cfg(unix)]
     {
         let slot = process::Slot::acquire(root)?;
         let scratch = tempfile::tempdir().map_err(|_| Failure::unavailable())?;
         let wire = WorkerRequest {
             root: root.canonicalize().map_err(|_| Failure::unavailable())?,
-            request: request.clone(),
+            request,
         };
         let input = serde_json::to_vec(&wire).map_err(|_| Failure::unavailable())?;
+        if input.len() > MAX_REQUEST_BYTES + 4096 {
+            return Err(Failure::new(
+                "invalid_argument",
+                "Worker request too large",
+                "request",
+            ));
+        }
         let mut command = Command::new(executable);
         command
             .args(["asi", "query-worker"])
@@ -167,7 +211,7 @@ pub fn run(executable: &Path, root: &Path, request: &Request) -> Result<QueryRes
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        process::configure(&mut command, request.timeout_ms, &slot);
+        process::configure(&mut command, timeout_ms, &slot);
         let mut child = command.spawn().map_err(|_| Failure::unavailable())?;
         let mut stdin = child.stdin.take().ok_or_else(Failure::unavailable)?;
         let mut stdout = child.stdout.take().ok_or_else(Failure::unavailable)?;
@@ -185,7 +229,7 @@ pub fn run(executable: &Path, root: &Path, request: &Request) -> Result<QueryRes
             })();
             let _ = send.send(response);
         });
-        let deadline = started + Duration::from_millis(request.timeout_ms);
+        let deadline = started + Duration::from_millis(timeout_ms);
         let output = receive.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         if output.is_err() || Instant::now() >= deadline {
             process::kill(&mut child);
@@ -222,7 +266,7 @@ pub fn run(executable: &Path, root: &Path, request: &Request) -> Result<QueryRes
         if let Ok(failure) = serde_json::from_slice::<Failure>(&output) {
             return Err(failure);
         }
-        if output.len() > request.max_bytes {
+        if output.len() > max_bytes {
             return Err(Failure::resource());
         }
         if !status.success() {
@@ -232,7 +276,7 @@ pub fn run(executable: &Path, root: &Path, request: &Request) -> Result<QueryRes
     }
     #[cfg(not(unix))]
     {
-        let _ = (executable, root, started);
+        let _ = (executable, root, request, timeout_ms, max_bytes, started);
         Err(Failure::new(
             "capability_unavailable",
             "Query process limits require Unix",
@@ -242,8 +286,9 @@ pub fn run(executable: &Path, root: &Path, request: &Request) -> Result<QueryRes
 }
 
 /// Internal CLI protocol: one bounded JSON request on stdin, one result/error on
-/// stdout, no logs or caller-controlled paths in errors. Returns an exit status.
-pub fn worker_stdio() -> i32 {
+/// stdout, no logs or caller-controlled paths in errors. Host-owned operations
+/// run inside the same bounded worker as SQL.
+pub fn worker_stdio(extension: impl FnOnce(&Path, Value) -> Result<Value, Failure>) -> i32 {
     let started = Instant::now();
     let result = (|| {
         let mut input = Vec::new();
@@ -258,11 +303,31 @@ pub fn worker_stdio() -> i32 {
                 "request",
             ));
         }
-        let wire: WorkerRequest = serde_json::from_slice(&input)
+        let wire: WorkerRequest<Value> = serde_json::from_slice(&input)
             .map_err(|_| Failure::new("invalid_argument", "Invalid worker request", "request"))?;
-        wire.request.validate()?;
+        if wire.request.get("extension").is_some() {
+            let request: ExtensionRequest<Value> =
+                serde_json::from_value(wire.request).map_err(|_| {
+                    Failure::new("invalid_argument", "Invalid worker request", "request")
+                })?;
+            #[cfg(unix)]
+            process::limits(default_timeout()).map_err(|_| Failure::resource())?;
+            #[cfg(unix)]
+            return extension(&wire.root, request.extension);
+            #[cfg(not(unix))]
+            let _ = (extension, request);
+            #[cfg(not(unix))]
+            return Err(Failure::new(
+                "capability_unavailable",
+                "Query process limits require Unix",
+                "platform",
+            ));
+        }
+        let request: Request = serde_json::from_value(wire.request)
+            .map_err(|_| Failure::new("invalid_argument", "Invalid worker request", "request"))?;
+        request.validate()?;
         #[cfg(unix)]
-        process::limits(wire.request.timeout_ms).map_err(|_| Failure::resource())?;
+        process::limits(request.timeout_ms).map_err(|_| Failure::resource())?;
         #[cfg(not(unix))]
         return Err(Failure::new(
             "capability_unavailable",
@@ -270,7 +335,8 @@ pub fn worker_stdio() -> i32 {
             "platform",
         ));
         #[cfg(unix)]
-        engine::execute(&wire.root, &wire.request, started)
+        engine::execute(&wire.root, &request, started)
+            .and_then(|result| serde_json::to_value(result).map_err(|_| Failure::unavailable()))
     })();
     let (output, status) = match result {
         Ok(result) => (serde_json::to_vec(&result), 0),

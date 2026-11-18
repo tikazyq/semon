@@ -259,6 +259,12 @@ it never becomes an empty source or a complete partial success. Capacity and
 source-unavailable responses remain distinct. The hosted adapter adds bounded
 request admission, a deadline and the existing Catalog publication coordinator.
 
+The separate ASI `search` and `view` tools read committed body rows from the
+origin’s schema 48 Event Index. Ingest indexes verified complete records in
+the same transaction as the native ledger and replaces the body rows on
+rewrite or relocation. Those tools do not replay native bytes. This does
+not change the generation checks or source custody of native transcript reads.
+
 ## Cold Catalog search scheduling
 
 A valid partial Catalog read in the draining phase checks pending identity hints

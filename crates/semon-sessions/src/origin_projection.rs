@@ -1092,12 +1092,16 @@ fn trigger(trigger: native_activity::Trigger) -> Trigger {
 }
 
 fn step_uid(session_uid: &str, id: &native_activity::ActivityStepId) -> String {
+    format!("{session_uid}/s/{}", step_uid_suffix(id))
+}
+
+pub(crate) fn step_uid_suffix(id: &native_activity::ActivityStepId) -> String {
     match id {
         native_activity::ActivityStepId::Claude(message) => {
-            format!("{session_uid}/s/claude/{}", encode_component(message))
+            format!("claude/{}", encode_component(message))
         }
         native_activity::ActivityStepId::Codex([thread, session, turn, response]) => format!(
-            "{session_uid}/s/codex/{}/{}/{}/{}",
+            "codex/{}/{}/{}/{}",
             encode_component(thread),
             encode_component(session),
             encode_component(turn),

@@ -183,7 +183,11 @@ transfer. It runs per namespace and supplies:
   metadata. D7 permits those typed paths in receiver analytics, not in arbitrary
   display fields. Repository dependencies use the effective native working
   directory, including a subagent sidecar's `worktreePath`.
-- **Bodies for FTS5** (phase 2): see [ASI query](asi-query.md#search).
+- **Bodies for FTS5** live in the private origin Event Index (schema 48).
+  Verified ingest writes the text and postings with the source ledger, with
+  transactional replacement on rewrite and relocation. Body IDs are stored
+  relative to the origin’s analytics namespace. The analytics store and
+  federation exports remain body-free. See [ASI query](asi-query.md#search).
 
 ## Analytics model
 

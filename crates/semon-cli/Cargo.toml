@@ -18,6 +18,7 @@ asi-query = ["semon-asi/query-engine"]
 semon-asi = { path = "../semon-asi" }
 semon-push = { path = "../semon-push" }
 semon-sessions = { path = "../semon-sessions" }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]
