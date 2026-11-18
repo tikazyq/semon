@@ -144,6 +144,9 @@ their archived prefix in custody without advertising a rebuildable source.
 Replay verifies the length and SHA-256 of the logical chain and the ledger's
 tail digest. A private seekable snapshot feeds the same native index parser
 used for live files, preserving offsets, source identity, and sidecar evidence.
+The producer keeps the carrier selected during the scan through publication. If
+a live file disappears during preparation, that attempt fails. A fresh scan can
+select the verified archive.
 If the archived source was sealed, the archiver copied its logical bytes
 through the sealed log reader. Replay works after the native file is removed.
 The archive does not grant hosted provider access or change that provider's

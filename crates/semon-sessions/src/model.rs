@@ -1064,6 +1064,7 @@ enum Role {
 type FileRevision = events::FileRevision;
 
 struct SourceFile {
+    archived: bool,
     revision: FileRevision,
     path: PathBuf,
     stamp: Stamp,
@@ -1134,7 +1135,19 @@ struct Stamp {
     changed_ns: Option<i128>,
 }
 
-fn indexed_stamp(cache: &EventCache, path: &Path, before: Stamp) -> Stamp {
+fn indexed_stamp(cache: &EventCache, path: &Path, before: Stamp, archived: bool) -> Stamp {
+    if archived {
+        let stat = cache
+            .indexed_stat(path)
+            .expect("archive scan has an original stat");
+        return Stamp {
+            dev: stat.dev,
+            ino: stat.ino,
+            size: stat.size,
+            modified_ns: stat.modified_ns,
+            changed_ns: stat.changed_ns,
+        };
+    }
     if cache.is_scoped()
         && let Some(stat) = cache.indexed_stat(path)
         && (stat.dev, stat.ino, stat.modified_ns, stat.changed_ns)
@@ -1380,14 +1393,15 @@ fn scan(
         // Stamped before it is read, so a line that lands during the read
         // counts toward the next version, not this one.
         let stamp = stamp_of(&path);
-        let summary = match events::scan_source(&path, "claude", cache, dirty, archive_options) {
-            Ok(summary) => summary,
-            Err(error) if selected.is_some() && error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(error);
-            }
-            Err(_) => continue,
-        };
-        let stamp = indexed_stamp(cache, &path, stamp);
+        let (summary, archived) =
+            match events::scan_source(&path, "claude", cache, dirty, archive_options) {
+                Ok(summary) => summary,
+                Err(error) if selected.is_some() && error.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(error);
+                }
+                Err(_) => continue,
+            };
+        let stamp = indexed_stamp(cache, &path, stamp, archived);
         if let Role::Agent(agent) = &mut role {
             let metadata = summary
                 .claude_sidecar
@@ -1408,6 +1422,7 @@ fn scan(
         texts.generation(&path, stamp);
         seen.insert(path.to_string_lossy().into_owned());
         files.push(SourceFile {
+            archived,
             revision: cache.revision(&path).expect("scanned file has a ledger"),
             stamp,
             id: id.to_owned(),
@@ -1445,14 +1460,15 @@ fn scan(
             continue;
         }
         let stamp = stamp_of(&path);
-        let summary = match events::scan_source(&path, "codex", cache, dirty, archive_options) {
-            Ok(summary) => summary,
-            Err(error) if selected.is_some() && error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(error);
-            }
-            Err(_) => continue,
-        };
-        let stamp = indexed_stamp(cache, &path, stamp);
+        let (summary, archived) =
+            match events::scan_source(&path, "codex", cache, dirty, archive_options) {
+                Ok(summary) => summary,
+                Err(error) if selected.is_some() && error.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(error);
+                }
+                Err(_) => continue,
+            };
+        let stamp = indexed_stamp(cache, &path, stamp, archived);
         let Some(header) = summary.codex_header.as_ref() else {
             return Err(io::Error::other("native Codex header was not observed"));
         };
@@ -1465,6 +1481,7 @@ fn scan(
         texts.generation(&path, stamp);
         seen.insert(path.to_string_lossy().into_owned());
         files.push(SourceFile {
+            archived,
             revision: cache.revision(&path).expect("scanned file has a ledger"),
             marker: None,
             stamp,
@@ -1505,20 +1522,24 @@ fn scan(
             Err(error) => return Err(error),
         }
         let stamp = stamp_of(&path);
-        let summary = match events::scan_source(&path, "copilot", cache, dirty, archive_options) {
-            Ok(summary) => summary,
-            Err(error) if error.kind() == io::ErrorKind::NotFound && archive_options.is_some() => {
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let stamp = indexed_stamp(cache, &path, stamp);
+        let (summary, archived) =
+            match events::scan_source(&path, "copilot", cache, dirty, archive_options) {
+                Ok(summary) => summary,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound && archive_options.is_some() =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        let stamp = indexed_stamp(cache, &path, stamp, archived);
         if cache.replaced(&path) {
             texts.invalidate(&path);
         }
         texts.generation(&path, stamp);
         seen.insert(path.to_string_lossy().into_owned());
         files.push(SourceFile {
+            archived,
             revision: cache.revision(&path).expect("scanned file"),
             stamp,
             id,
@@ -1542,7 +1563,9 @@ fn scan(
     // prefix the index consumed so far.
     if options.facts.is_none() {
         for file in &files {
-            if let Some(input) = crate::native_evidence::catalog_input(&file.path, options) {
+            if !file.archived
+                && let Some(input) = crate::native_evidence::catalog_input(&file.path, options)
+            {
                 cache.archive_consumed(
                     options,
                     input,
@@ -1562,14 +1585,12 @@ fn scan(
 fn verify_sidecars(options: &Options, files: &[SourceFile]) -> io::Result<()> {
     if files.iter().any(|file| {
         file.summary.claude_sidecar.as_ref().is_some_and(|sidecar| {
-            if sidecar.current(&file.path) {
-                return false;
+            if !file.archived {
+                return !sidecar.current(&file.path);
             }
-            let source = summary::source(file);
-            options.facts.is_some()
-                || !crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache))
-                    .matches_source(options, &source, Some(sidecar))
-                    .unwrap_or(false)
+            !crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache))
+                .matches_source(options, &summary::source(file), Some(sidecar))
+                .unwrap_or(false)
         })
     }) {
         return Err(io::Error::new(
@@ -7653,12 +7674,18 @@ pub(crate) fn prepare_semantic_index_sources(
     )?;
     verify_sidecars(options, &files)?;
     let claims = cache.catalog_claims(&paths)?;
-    let proofs = crate::query_source::Sources::capture(
+    let mut proofs = crate::query_source::Sources::capture(
         options,
         files
             .iter()
             .map(|file| (summary::source(file), file.summary.source_chunks.clone())),
     )?;
+    proofs.pin_archive_sources(
+        files
+            .iter()
+            .filter(|file| file.archived)
+            .map(|file| file.path.clone()),
+    );
     let records = proofs.reader();
     records.verify_all()?;
     for file in &mut files {
@@ -8054,6 +8081,7 @@ fn prepare_history_inner(
                 }
             };
             files.push(SourceFile {
+                archived: false,
                 revision: (
                     source.dev,
                     source.ino,
@@ -8332,10 +8360,16 @@ fn build_sources_inner(
     let sources = files
         .iter()
         .map(|file| (summary::source(file), file.summary.source_chunks.clone()));
-    let source_proofs = measured!(
+    let mut source_proofs = measured!(
         "source_capture",
         files.len(),
         crate::query_source::Sources::capture(options, sources)?
+    );
+    source_proofs.pin_archive_sources(
+        files
+            .iter()
+            .filter(|file| file.archived)
+            .map(|file| file.path.clone()),
     );
     let source_records = source_proofs.reader();
     if history_records.is_none() {

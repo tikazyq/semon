@@ -45,6 +45,7 @@ pub(crate) struct Sources {
     paths: BTreeMap<(String, String), PathBuf>,
     diagnostic_scope: PathBuf,
     archive_options: Option<Options>,
+    producer_archives: Option<BTreeSet<PathBuf>>,
     #[cfg(feature = "test-hooks")]
     cache: PathBuf,
 }
@@ -85,9 +86,15 @@ impl Sources {
             paths: BTreeMap::new(),
             diagnostic_scope: crate::events::EventCache::path(&options.cache),
             archive_options: options.facts.is_none().then(|| options.clone()),
+            producer_archives: None,
             #[cfg(feature = "test-hooks")]
             cache: options.cache.clone(),
         }
+    }
+
+    /// Carry the scanner's carrier decision through derivation and publication.
+    pub(crate) fn pin_archive_sources(&mut self, paths: impl Iterator<Item = PathBuf>) {
+        self.producer_archives = Some(paths.collect());
     }
 
     pub(crate) fn capture(
@@ -380,6 +387,11 @@ impl Records<'_> {
         if self.provider.is_some() {
             return Ok(None);
         }
+        let pinned = match &self.sources.producer_archives {
+            Some(paths) if paths.contains(path) => true,
+            Some(_) => return Ok(None),
+            None => false,
+        };
         let mut archived = self.archived.lock().map_err(|_| unavailable())?;
         if let Some(file) = archived.get_mut(path) {
             if !matches!(crate::open_input(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
@@ -395,11 +407,11 @@ impl Records<'_> {
             .contains_key(path)
             || !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
         {
-            return Ok(None);
+            return if pinned { Err(unavailable()) } else { Ok(None) };
         }
         let archive = crate::archive::Archive::new(crate::archive::standalone_dir(&options.cache));
         let Some((native, mut file)) = archive.open_native(options, path)? else {
-            return Ok(None);
+            return if pinned { Err(unavailable()) } else { Ok(None) };
         };
         let reference = proof.source.as_ref().ok_or_else(unavailable)?;
         if native.ledger != proof.ledger

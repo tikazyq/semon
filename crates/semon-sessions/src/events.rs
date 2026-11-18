@@ -2986,7 +2986,7 @@ pub(crate) fn scan_file(
     cache: &mut EventCache,
     dirty: &mut bool,
 ) -> io::Result<Arc<FileIndex>> {
-    scan_source(path, harness, cache, dirty, None)
+    scan_source(path, harness, cache, dirty, None).map(|(index, _)| index)
 }
 
 pub(crate) fn scan_source(
@@ -2995,7 +2995,7 @@ pub(crate) fn scan_source(
     cache: &mut EventCache,
     dirty: &mut bool,
     options: Option<&crate::Options>,
-) -> io::Result<Arc<FileIndex>> {
+) -> io::Result<(Arc<FileIndex>, bool)> {
     let key = path.to_string_lossy().into_owned();
     if let Some(index) = cache.files.get(&key).and_then(|entry| entry.index.as_ref()) {
         cache.require_usage_store(index)?;
@@ -3035,7 +3035,7 @@ pub(crate) fn scan_source(
         && Stat::of(path).is_ok_and(|stat| entry.ledger.stat == stat)
     {
         trace("unchanged");
-        return Ok(Arc::clone(index));
+        return Ok((Arc::clone(index), false));
     }
     *dirty = true;
     let mut attempt = 0;
@@ -3177,7 +3177,7 @@ pub(crate) fn scan_source(
                     index: Some(Arc::clone(index)),
                 },
             );
-            return Ok(Arc::clone(index));
+            return Ok((Arc::clone(index), archived.is_some()));
         }
         if let Some(native) = &archived
             && harness == "copilot"
@@ -3544,7 +3544,7 @@ pub(crate) fn scan_source(
                 index: Some(Arc::clone(&index)),
             },
         );
-        return Ok(index);
+        return Ok((index, archived.is_some()));
     }
 }
 

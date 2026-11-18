@@ -281,8 +281,12 @@ fn native_producer_scoped_preparation_rejects_deleted_evidence() {
     crate::model::AFTER_SCAN.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || fs::remove_file(path).unwrap()));
     });
-    assert!(crate::model::prepare_sources(&home.options, &mut cache, &[input], NOW).is_err());
+    let inputs = std::slice::from_ref(&input);
+    assert!(crate::model::prepare_sources(&home.options, &mut cache, inputs, NOW).is_err());
     assert_eq!(catalog_generation(&home), None);
+
+    // A fresh scan can explicitly select the verified archive.
+    assert!(crate::model::prepare_sources(&home.options, &mut cache, inputs, NOW).is_ok());
 }
 
 #[test]

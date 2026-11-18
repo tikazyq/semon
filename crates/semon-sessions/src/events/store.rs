@@ -7164,6 +7164,8 @@ mod tests {
             .unwrap()
             .unwrap();
         crate::retain_source_event_index(&options, "", &proof, &ready).unwrap();
+        // This fixture exercises replacement after the original becomes unavailable.
+        fs::remove_dir_all(crate::archive::standalone_dir(&options.cache)).unwrap();
         fs::remove_file(original).unwrap();
         let replacement = options
             .claude_home
@@ -10775,6 +10777,8 @@ mod tests {
         };
         let before = count("changed");
         assert!(before >= 1);
+        // Withdrawal requires losing both carriers for this source.
+        fs::remove_dir_all(crate::archive::standalone_dir(&options.cache)).unwrap();
         fs::remove_file(&claude.sources[0].path).unwrap();
         let evidence = crate::native_evidence::NativeEvidence::new(options.clone());
         let mut complete = false;
